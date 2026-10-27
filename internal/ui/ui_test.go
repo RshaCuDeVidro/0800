@@ -319,12 +319,17 @@ func TestPrettyFS(t *testing.T) {
 	}
 }
 
-func TestPipeShareIsNotOpened(t *testing.T) {
-	b := &browser{mode: modeShares, shares: []shareItem{{Name: "IPC$", Type: "pipe"}}}
-	if cmd := b.open(); cmd != nil {
-		t.Fatal("pipe shares must not start a session")
+func TestPipeShareOpens(t *testing.T) {
+	b := &browser{
+		mode:   modeShares,
+		hostIP: "192.0.2.1",
+		auth:   "null",
+		shares: []shareItem{{Name: "IPC$", Type: "pipe"}},
 	}
-	if b.err == "" || !strings.Contains(b.err, "named pipe") {
-		t.Fatalf("err = %q", b.err)
+	if cmd := b.open(); cmd == nil {
+		t.Fatal("IPC$ must be openable (it lists named pipes)")
+	}
+	if !b.loading {
+		t.Error("expected the share to start loading")
 	}
 }
