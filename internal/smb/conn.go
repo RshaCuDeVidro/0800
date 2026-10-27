@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 	"unicode/utf16"
 )
@@ -36,6 +37,7 @@ const (
 	dialect21   uint16 = 0x0210
 	dialect30   uint16 = 0x0300
 	dialect302  uint16 = 0x0302
+	dialect311  uint16 = 0x0311
 )
 
 // ShareMode selects how hard to look for shares when srvsvc is blocked.
@@ -107,6 +109,12 @@ func parseHeader(b []byte) (header, error) {
 type conn struct {
 	net.Conn
 	cfg Config
+
+	// mu serialises request/response round trips. The TUI downloads a file in
+	// a goroutine while the user keeps browsing the same session; without
+	// this their frames interleave and call() drops the other caller's
+	// response as a "stale" message ID, hanging it until the timeout.
+	mu sync.Mutex
 
 	nextMsgID uint64
 	sessionID uint64
@@ -199,6 +207,8 @@ func (c *conn) readFrame() ([]byte, error) {
 // returned in hdr.Status, not as a Go error, because callers sometimes need to
 // inspect them.
 func (c *conn) call(ctx context.Context, cmd uint16, treeID uint32, sessionID uint64, body []byte) (header, []byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if err := c.Conn.SetDeadline(c.deadline(ctx)); err != nil {
 		return header{}, nil, err
 	}

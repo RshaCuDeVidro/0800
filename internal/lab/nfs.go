@@ -123,9 +123,11 @@ func lbNFSHandler(proc uint32) []byte {
 		w.u32(0)
 		w.fixed(make([]byte, 8))
 		w.u32(1)
+		w.u64(11) // fileid (fileid3 is a uint64, RFC 1813)
 		w.str("dump.sql")
 		w.u64(1)
 		w.u32(1)
+		w.u64(12) // fileid
 		w.str("notes.txt")
 		w.u64(2)
 		w.u32(0)
@@ -135,7 +137,7 @@ func lbNFSHandler(proc uint32) []byte {
 		w.u32(0)
 		w.fixed(make([]byte, 8))
 		w.u32(1)
-		w.u32(1)
+		w.u64(11) // fileid
 		w.str("dump.sql")
 		w.u64(1)
 		w.u32(1)
@@ -143,7 +145,7 @@ func lbNFSHandler(proc uint32) []byte {
 		w.u32(1)
 		w.opaque([]byte("LABDUMP"))
 		w.u32(1)
-		w.u32(2)
+		w.u64(12) // fileid
 		w.str("notes.txt")
 		w.u64(2)
 		w.u32(1)

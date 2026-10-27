@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -43,6 +44,9 @@ const (
 
 // Client is a single ONC RPC connection.
 type Client struct {
+	// mu serialises calls: xid, the deadline and the reply stream are shared,
+	// and a download runs concurrently with browsing on one connection.
+	mu      sync.Mutex
 	conn    net.Conn
 	r       *bufio.Reader
 	xid     uint32
@@ -85,6 +89,8 @@ func authUnix(uid, gid uint32) []byte {
 
 // call performs one RPC request and returns the result body.
 func (c *Client) call(ctx context.Context, prog, vers, proc uint32, args []byte) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if err := c.conn.SetDeadline(c.deadline(ctx)); err != nil {
 		return nil, err
 	}
@@ -311,6 +317,19 @@ func (r *xdrReader) u64() uint64 {
 	hi := r.u32()
 	lo := r.u32()
 	return uint64(hi)<<32 | uint64(lo)
+}
+
+// bytes reads n bytes of fixed-length opaque data (e.g. a cookieverf3),
+// consuming the XDR padding.
+func (r *xdrReader) bytes(n int) []byte {
+	if n < 0 || r.pos+((n+3)&^3) > len(r.b) {
+		r.err = io.ErrUnexpectedEOF
+		r.pos = len(r.b)
+		return make([]byte, max(n, 0))
+	}
+	out := append([]byte(nil), r.b[r.pos:r.pos+n]...)
+	r.skip(n)
+	return out
 }
 
 func (r *xdrReader) skip(n int) {

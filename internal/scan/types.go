@@ -21,6 +21,36 @@ const (
 // MarshalJSON renders severity as a string so reports stay readable.
 func (s Severity) MarshalJSON() ([]byte, error) { return []byte(`"` + s.String() + `"`), nil }
 
+// UnmarshalJSON reads the string form MarshalJSON writes, so a saved report
+// can be loaded again (--diff, --resume).
+func (s *Severity) UnmarshalJSON(b []byte) error {
+	str := strings.Trim(string(b), `"`)
+	v, ok := ParseSeverity(str)
+	if !ok {
+		return fmt.Errorf("unknown severity %q", str)
+	}
+	*s = v
+	return nil
+}
+
+// ParseSeverity maps "critical", "high", "medium", "low" or "info" back to a
+// Severity.
+func ParseSeverity(name string) (Severity, bool) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "critical":
+		return SevCritical, true
+	case "high":
+		return SevHigh, true
+	case "medium", "med":
+		return SevMedium, true
+	case "low":
+		return SevLow, true
+	case "info", "":
+		return SevInfo, true
+	}
+	return SevInfo, false
+}
+
 func (s Severity) String() string {
 	switch s {
 	case SevCritical:

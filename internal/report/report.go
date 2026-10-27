@@ -20,6 +20,12 @@ type Document struct {
 	Elapsed  string           `json:"elapsed"`
 	Stats    Stats            `json:"stats"`
 	Hosts    []*scan.HostView `json:"hosts"`
+
+	// Partial marks a report written before every target was scanned (a
+	// checkpoint, or a scan stopped early). Pending lists the targets that were
+	// not finished, which is what --resume continues with.
+	Partial bool     `json:"partial,omitempty"`
+	Pending []string `json:"pending,omitempty"`
 }
 
 // Stats summarises a scan.
@@ -49,10 +55,47 @@ func Build(snap *scan.Snapshot, version string) Document {
 		Hosts: make([]*scan.HostView, 0, len(snap.Hosts)),
 	}
 	for _, h := range snap.Hosts {
+		if h.State != scan.StateDone && snap.Done < snap.Total {
+			// Not finished yet: --resume probes it again. Its partial results
+			// stay in the report (an interactive export mid-scan wants them),
+			// but LoadResume drops them so the re-probe cannot duplicate them.
+			doc.Partial = true
+			doc.Pending = append(doc.Pending, h.IP)
+		}
 		if len(h.Ports) == 0 && h.Err == "" {
 			continue // silent hosts add noise, not signal
 		}
 		doc.Hosts = append(doc.Hosts, h)
+	}
+	return doc
+}
+
+// BuildFiltered builds a document from only the hosts keep accepts (the TUI's
+// "export marked"). Unlike Build it keeps silent hosts too: if the operator
+// starred it, it belongs in the report. Stats are recomputed for the subset.
+func BuildFiltered(snap *scan.Snapshot, version string, keep func(*scan.HostView) bool) Document {
+	doc := Document{
+		Tool:     "0800",
+		Version:  version,
+		Started:  snap.Started,
+		Finished: time.Now(),
+		Elapsed:  time.Since(snap.Started).Round(time.Millisecond).String(),
+		Hosts:    make([]*scan.HostView, 0),
+	}
+	for _, h := range snap.Hosts {
+		if !keep(h) {
+			continue
+		}
+		doc.Hosts = append(doc.Hosts, h)
+		doc.Stats.Targets++
+		if h.State == scan.StateDone {
+			doc.Stats.Scanned++
+		}
+		doc.Stats.OpenPorts += len(h.Ports)
+		doc.Stats.Findings += h.Discovered()
+		if h.Discovered() > 0 {
+			doc.Stats.Exposed++
+		}
 	}
 	return doc
 }

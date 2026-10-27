@@ -7,6 +7,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -84,14 +85,8 @@ func ProbeHost(ctx context.Context, ip string, cfg Config) (p *Probe, err error)
 	authKinds := []string{"null", "guest"}
 	var lastErr error
 	for _, kind := range authKinds {
-		c, err := dial(ctx, addr, cfg)
+		c, nr, err := dialSMB2(ctx, addr, cfg)
 		if err != nil {
-			lastErr = err
-			continue
-		}
-		nr, err := c.negotiateSMB2(ctx)
-		if err != nil {
-			_ = c.Close()
 			lastErr = err
 			continue
 		}
@@ -171,12 +166,8 @@ type Client struct {
 
 // Connect opens a session using the given credential kind ("null" or "guest").
 func Connect(ctx context.Context, ip, kind string, cfg Config) (*Client, error) {
-	c, err := dial(ctx, cfg.address(ip), cfg)
+	c, _, err := dialSMB2(ctx, cfg.address(ip), cfg)
 	if err != nil {
-		return nil, err
-	}
-	if _, err := c.negotiateSMB2(ctx); err != nil {
-		_ = c.Close()
 		return nil, err
 	}
 	res, err := c.loginWithRetry(ctx, kind)
@@ -189,6 +180,48 @@ func Connect(ctx context.Context, ip, kind string, cfg Config) (*Client, error) 
 		return nil, fmt.Errorf("smb: authentication failed: %s", res.Status)
 	}
 	return &Client{c: c, host: ip, auth: kind}, nil
+}
+
+// dialSMB2 connects and negotiates SMB2. It offers dialects up to 3.0.2 first;
+// a server that refuses all of them (minimum protocol 3.1.1) is retried once on
+// a fresh connection offering 3.1.1 with its mandatory negotiate context. This
+// widens reach without changing the dialect any already-working host picks.
+func dialSMB2(ctx context.Context, addr string, cfg Config) (*conn, *negotiateResp, error) {
+	c, err := dial(ctx, addr, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	nr, err := c.negotiateSMB2(ctx)
+	if err == nil {
+		return c, nr, nil
+	}
+	_ = c.Close()
+	if !refusedDialects(err) {
+		return nil, nil, err
+	}
+
+	c2, derr := dial(ctx, addr, cfg)
+	if derr != nil {
+		return nil, nil, err
+	}
+	nr, derr = c2.negotiateSMB2With(ctx, smb2Dialects311)
+	if derr != nil {
+		_ = c2.Close()
+		return nil, nil, err // the first error is the more telling one
+	}
+	return c2, nr, nil
+}
+
+// refusedDialects reports whether a failed NEGOTIATE looks like "none of the
+// dialects you offered are acceptable": an explicit STATUS_NOT_SUPPORTED, or a
+// connection the server dropped without answering. Garbage replies (not SMB at
+// all) are deliberately not retried.
+func refusedDialects(err error) bool {
+	if st, ok := err.(Status); ok {
+		return st == StatusNotSupported
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET)
 }
 
 // loginWithRetry falls back to a raw Type 3 token for appliances that reject
@@ -368,6 +401,37 @@ func (c *Client) Open(ctx context.Context, share, path string) (io.ReadCloser, i
 		return nil, 0, err
 	}
 	return &fileReader{c: c.c, treeID: tree.id, id: id, ctx: context.WithoutCancel(ctx), size: size}, size, nil
+}
+
+// Peek reads at most n bytes from the start of a remote file in a single READ,
+// and returns the file size. Previews use it so that looking at a file costs
+// one round trip instead of streaming the 1 MiB chunk Open would request.
+func (c *Client) Peek(ctx context.Context, share, path string, n int) ([]byte, int64, error) {
+	tree, err := c.connectShare(ctx, share)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer c.c.treeDisconnect(ctx, tree.id)
+	id, size, _, err := c.c.create(ctx, tree.id, normaliseSharePath(path),
+		fileReadData|fileReadAttributes|synchronize,
+		0x80, 7, fileOpen, fileNonDirectoryFile|fileSynchronousIoNonAlert)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer c.c.closeFile(ctx, tree.id, id)
+
+	want := uint32(n)
+	if size > 0 && int64(want) > size {
+		want = uint32(size)
+	}
+	if want == 0 {
+		return nil, size, nil
+	}
+	data, err := c.c.readAt(ctx, tree.id, id, 0, want)
+	if errors.Is(err, io.EOF) {
+		return nil, size, nil
+	}
+	return data, size, err
 }
 
 type treeConn struct {

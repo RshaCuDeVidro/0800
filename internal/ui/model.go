@@ -58,7 +58,19 @@ type Model struct {
 	browser     browser
 
 	filtering bool
-	input     textinput.Model
+	// filterRemote routes the "/" filter to the remote file tree instead of
+	// the host list (when the tree has focus).
+	filterRemote bool
+	input        textinput.Model
+
+	// minSev hides hosts below a severity (key: v). SevInfo shows everything.
+	minSev scan.Severity
+	// marks are the hosts the operator starred (key: m), exported by E.
+	marks map[string]bool
+	// preview is the open file preview overlay (key: p).
+	preview *previewState
+	// rateHist feeds the header sparkline.
+	rateHist []float64
 
 	spinner  spinner.Model
 	scanning bool
@@ -88,6 +100,12 @@ type downloadedMsg struct {
 	dest string
 	size int64
 	err  error
+
+	// Recursive downloads (key: D).
+	tree    bool
+	files   int
+	skipped int
+	note    string
 }
 
 type exportedMsg struct {
@@ -97,12 +115,18 @@ type exportedMsg struct {
 	err  error
 }
 
+type copiedMsg struct {
+	text string
+	err  error
+}
+
 // listState is the cheap signature used to decide whether the visible list has
 // to be rebuilt and re-sorted.
 type listState struct {
 	n, done, open, findings int
 	filter                  string
 	all                     bool
+	minSev                  scan.Severity
 }
 
 const (
@@ -174,6 +198,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
+	case tea.MouseMsg:
+		return m, m.handleMouse(msg)
+
+	case previewMsg:
+		if m.preview != nil && m.preview.name == msg.name {
+			m.preview = newPreview(msg)
+		}
+		return m, nil
+
+	case copiedMsg:
+		if msg.err != nil {
+			m.toast("copy failed: "+msg.err.Error(), scan.SevHigh)
+		} else {
+			m.toast("copied "+truncate(msg.text, 60), scan.SevInfo)
+		}
+		return m, nil
+
 	case connectedMsg:
 		m.browser.applyConnected(msg)
 		if msg.err != nil {
@@ -209,9 +250,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case downloadedMsg:
-		if msg.err != nil {
+		switch {
+		case msg.err != nil:
 			m.toast("download failed: "+msg.err.Error(), scan.SevHigh)
-		} else {
+		case msg.tree:
+			text := fmt.Sprintf("saved %d file(s), %s → %s", msg.files, humanSize(msg.size), msg.dest)
+			sev := scan.SevInfo
+			if msg.skipped > 0 || msg.note != "" {
+				text += fmt.Sprintf(" · %d skipped", msg.skipped)
+				if msg.note != "" {
+					text += " (" + msg.note + ")"
+				}
+				sev = scan.SevLow
+			}
+			m.toast(text, sev)
+		default:
 			m.toast(fmt.Sprintf("saved %s (%s)", msg.dest, humanSize(msg.size)), scan.SevInfo)
 		}
 		m.dl = nil
@@ -236,21 +289,18 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.filtering = false
 			m.input.Blur()
-			m.filter = ""
 			m.input.SetValue("")
-			m.refresh()
+			m.applyFilter("")
 			return m, nil
 		case "enter":
 			m.filtering = false
 			m.input.Blur()
-			m.filter = strings.TrimSpace(m.input.Value())
-			m.refresh()
+			m.applyFilter(strings.TrimSpace(m.input.Value()))
 			return m, nil
 		}
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
-		m.filter = strings.TrimSpace(m.input.Value())
-		m.refresh()
+		m.applyFilter(strings.TrimSpace(m.input.Value()))
 		return m, cmd
 	}
 
@@ -265,14 +315,45 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.showSummary {
 			m.summaryOff = 0
 			m.showDetails = false
+			m.preview = nil
 		}
 		return m, nil
 	case "tab":
 		m.showDetails = !m.showDetails
 		m.showSummary = false
+		m.preview = nil
 		if m.showDetails {
 			m.focus = 1
 			m.detailsOff = 0
+		}
+		return m, nil
+	case "v":
+		m.minSev = nextMinSev(m.minSev)
+		m.refresh()
+		m.toast("showing "+minSevLabel(m.minSev), scan.SevInfo)
+		return m, nil
+	case "m":
+		if h := m.selected(); h != nil {
+			if m.marks == nil {
+				m.marks = map[string]bool{}
+			}
+			if m.marks[h.IP] {
+				delete(m.marks, h.IP)
+				m.toast("unmarked "+h.IP, scan.SevInfo)
+			} else {
+				m.marks[h.IP] = true
+				m.toast(fmt.Sprintf("marked %s (%d marked · E exports them)", h.IP, len(m.marks)), scan.SevInfo)
+			}
+		}
+		return m, nil
+	case "E":
+		return m, m.exportMarked()
+	case "y":
+		return m, m.copyCurrent()
+	case "c":
+		if m.dl != nil && m.dl.cancel != nil {
+			m.dl.cancel()
+			m.toast("cancelling download…", scan.SevInfo)
 		}
 		return m, nil
 	case "a":
@@ -294,8 +375,16 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "/":
 		m.filtering = true
+		m.filterRemote = m.w >= 78 && m.focus == 1 && !m.showDetails && m.preview == nil &&
+			m.browser.filterable()
 		m.input.Focus()
-		m.input.SetValue(m.filter)
+		if m.filterRemote {
+			m.input.Placeholder = "filter this directory"
+			m.input.SetValue(m.browser.filter)
+		} else {
+			m.input.Placeholder = "ip, name or tag"
+			m.input.SetValue(m.filter)
+		}
 		return m, textinput.Blink
 	}
 
@@ -347,6 +436,9 @@ func (m *Model) keyHosts(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (m *Model) keyRemote(msg tea.KeyMsg) tea.Cmd {
+	if m.preview != nil {
+		return m.keyPreview(msg)
+	}
 	if m.showDetails {
 		switch {
 		case matches(msg, keys.Down):
@@ -395,11 +487,20 @@ func (m *Model) keyRemote(msg tea.KeyMsg) tea.Cmd {
 		return m.browser.open()
 	case msg.String() == "g":
 		return m.download()
+	case msg.String() == "D":
+		return m.downloadDir()
+	case msg.String() == "p" || msg.String() == " ":
+		return m.openPreview()
 	case msg.String() == "r":
 		if m.browser.mode == modeDir {
 			return m.browser.listCmd(m.browser.path)
 		}
 	case msg.String() == "h" || msg.String() == "esc" || msg.String() == "left":
+		// Leaving a share closes its session; going up inside it does not.
+		if (m.browser.mode == modeShares || m.browser.mode == modeInfo ||
+			(m.browser.mode == modeDir && m.browser.path == "")) && m.downloadBusy() {
+			return nil
+		}
 		if cmd, handled := m.browser.back(); handled {
 			if m.browser.mode == modeEmpty {
 				m.focus = 0
@@ -416,6 +517,10 @@ func (m *Model) openHost() tea.Cmd {
 	if h == nil {
 		return nil
 	}
+	if m.downloadBusy() {
+		return nil
+	}
+	m.preview = nil
 	m.showSummary = false
 	cmd := m.browser.openHost(h)
 	m.showDetails = m.browser.mode == modeEmpty
@@ -447,6 +552,10 @@ func (m *Model) refresh() {
 			} else {
 				m.rate = m.rate*0.6 + inst*0.4
 			}
+			m.rateHist = append(m.rateHist, m.rate)
+			if len(m.rateHist) > 40 {
+				m.rateHist = m.rateHist[len(m.rateHist)-40:]
+			}
 			m.lastRateAt, m.lastDone = now, snap.Done
 		}
 	} else {
@@ -455,14 +564,15 @@ func (m *Model) refresh() {
 
 	sig := listState{
 		n: len(snap.Hosts), done: snap.Done, open: snap.Open,
-		findings: snap.Findings, filter: m.filter, all: m.allHosts,
+		findings: snap.Findings, filter: m.filter, all: m.allHosts, minSev: m.minSev,
 	}
 	if sig == m.listState {
 		return
 	}
 	// With a non-default sort a full rebuild costs O(n log n). Throttle it so a
 	// 65k-host scan does not re-sort ten times per second.
-	force := sig.filter != m.listState.filter || sig.all != m.listState.all
+	force := sig.filter != m.listState.filter || sig.all != m.listState.all ||
+		sig.minSev != m.listState.minSev
 	if m.sortMode != sortIP && !force && now.Sub(m.lastBuild) < 250*time.Millisecond {
 		return
 	}
@@ -479,6 +589,9 @@ func (m *Model) refresh() {
 			continue
 		}
 		if filter != "" && !hostMatches(h, filter) {
+			continue
+		}
+		if m.minSev > scan.SevInfo && h.Sev < m.minSev {
 			continue
 		}
 		m.hosts = append(m.hosts, h)
@@ -624,19 +737,15 @@ func (m *Model) main(h int) string {
 	if m.w < 78 {
 		return m.hostPanel(m.w, h, true)
 	}
-	leftW := m.w * 38 / 100
-	if leftW < 34 {
-		leftW = 34
-	}
-	if leftW > 56 {
-		leftW = 56
-	}
+	leftW := m.leftWidth()
 	rightW := m.w - leftW - 1
 
 	left := m.hostPanel(leftW, h, m.focus == 0)
 
 	var right string
 	switch {
+	case m.preview != nil && !m.showDetails:
+		right = renderPreview(m.preview, rightW, h, m.focus == 1)
 	case m.showDetails:
 		if sel := m.selected(); sel != nil {
 			right = renderDetails(sel, rightW, h, m.detailsOff, m.focus == 1)
@@ -722,8 +831,14 @@ func (m *Model) listTitle() string {
 	case sortFindings:
 		title += " · hits"
 	}
+	if tag := minSevTag(m.minSev); tag != "" {
+		title += " · " + tag
+	}
 	if m.filter != "" {
 		title += " · /" + m.filter
+	}
+	if n := len(m.marks); n > 0 {
+		title += fmt.Sprintf(" · ★%d", n)
 	}
 	return title
 }
@@ -747,6 +862,9 @@ func (m *Model) hostRow(h *scan.HostView, selected bool, width int) string {
 		barColor = colAccent
 	}
 	bar := lipgloss.NewStyle().Foreground(barColor).Render("▌") + " "
+	if m.marks[h.IP] {
+		bar = lipgloss.NewStyle().Foreground(colMed).Bold(true).Render("★") + " "
+	}
 	ip := h.IP
 
 	avail := width - 2 - 2 - lipgloss.Width(ip) - 1
@@ -850,11 +968,17 @@ func (m *Model) header() string {
 		parts := []string{fmt.Sprintf("%s  %3.0f%%", bar(pct, barW), pct*100), spinner}
 		if rate != "" {
 			parts = append(parts, rate)
+			if m.w >= 100 && len(m.rateHist) > 2 {
+				parts = append(parts, styleAccent.Render(sparkline(m.rateHist, 16)))
+			}
 		}
 		if eta != "—" {
 			parts = append(parts, "eta "+eta)
 		}
 		info = strings.Join(parts, "  ")
+	} else if m.snap != nil && m.snap.Done < m.snap.Total {
+		// The engine stopped (x / Ctrl-C) before every host was scanned.
+		info = fmt.Sprintf("%s  %3.0f%%  stopped · %d/%d scanned", bar(pct, barW), pct*100, m.snap.Done, m.snap.Total)
 	} else {
 		info = fmt.Sprintf("%s  100%%  %s", bar(1, barW), state)
 	}
@@ -899,8 +1023,17 @@ func (m *Model) footer() string {
 	hints := []hint{
 		{"j/k", "move"}, {"↵", "open"}, {"h", "back"}, {"g", "get"},
 		{"s", "summary"}, {"tab", "details"}, {"/", "filter"},
-		{"e", "report"}, {"o", "sort"}, {"x", "stop"}, {"?", "help"}, {"q", "quit"},
 	}
+	if m.focus == 1 && m.browser.mode == modeDir {
+		hints = append(hints, hint{"p", "preview"}, hint{"D", "get dir"})
+	} else {
+		hints = append(hints, hint{"v", "severity"}, hint{"m", "mark"})
+	}
+	if m.dl != nil {
+		hints = append(hints, hint{"c", "cancel"})
+	}
+	hints = append(hints, hint{"e", "report"}, hint{"o", "sort"}, hint{"x", "stop"},
+		hint{"?", "help"}, hint{"q", "quit"})
 	var b strings.Builder
 	used := 0
 	for _, h := range hints {
@@ -918,7 +1051,11 @@ func (m *Model) footer() string {
 	}
 	line1 := b.String()
 	if m.snap != nil && m.snap.Finished {
-		line1 = spread(line1, styleFaint.Render("scan complete"), m.w)
+		label := "scan complete"
+		if m.snap.Done < m.snap.Total {
+			label = "scan stopped"
+		}
+		line1 = spread(line1, styleFaint.Render(label), m.w)
 	}
 
 	status := m.statusLine()
@@ -936,9 +1073,15 @@ func (m *Model) statusLine() string {
 		if total > 0 {
 			pct = float64(done) / float64(total)
 		}
+		if m.dl.tree {
+			return styleAccent.Render(" ↓ ") + styleText.Render(m.dl.name) + " " +
+				styleDim.Render(fmt.Sprintf("%d file(s) · %s", m.dl.files.Load(), humanSize(done))) +
+				styleFaint.Render("  c cancels")
+		}
 		return styleAccent.Render(" ↓ ") +
 			styleText.Render(m.dl.name) + " " +
-			styleDim.Render(fmt.Sprintf("%s / %s  %3.0f%%", humanSize(done), humanSize(total), pct*100))
+			styleDim.Render(fmt.Sprintf("%s / %s  %3.0f%%", humanSize(done), humanSize(total), pct*100)) +
+			styleFaint.Render("  c cancels")
 	}
 	if m.showSummary {
 		return styleDim.Render(" summary · j/k scroll · s or esc to close")
@@ -987,13 +1130,21 @@ func (m *Model) helpView(h int) string {
 		{"↵ or l", "open share / directory"},
 		{"h or esc", "go back one level"},
 		{"g", "download the file"},
+		{"D", "download a directory (recursive)"},
+		{"p / space", "preview a file (text or hex)"},
 		{"tab", "host details"},
 		{"s", "exposure summary"},
-		{"/", "filter targets"},
+		{"/", "filter hosts / this directory"},
+		{"mouse", "wheel scrolls, click selects"},
 	}
 	act := [][2]string{
 		{"e", "export json + markdown + html"},
+		{"m", "mark / unmark the host"},
+		{"E", "export only the marked hosts"},
+		{"v", "severity floor: all / med / high / crit"},
 		{"o", "sort: ip / sev / hits"},
+		{"y", "copy the host IP or remote path"},
+		{"c", "cancel the running download"},
 		{"x", "stop the scan"},
 		{"a", "show silent targets"},
 		{"r", "reload directory"},
@@ -1057,6 +1208,10 @@ type downloadState struct {
 	name  string
 	total atomic.Int64
 	done  atomic.Int64
+	// files counts completed files of a recursive download; tree marks one.
+	files  atomic.Int64
+	tree   bool
+	cancel context.CancelFunc
 }
 
 type progressReader struct {
@@ -1084,14 +1239,18 @@ func (m *Model) download() tea.Cmd {
 	remote := joinRemote(m.browser.path, e.Name)
 	dest := m.destPath(e.Name)
 
-	st := &downloadState{name: e.Name}
+	if m.dl != nil {
+		m.toast("a download is already running (c cancels it)", scan.SevLow)
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+	st := &downloadState{name: e.Name, cancel: cancel}
 	if e.Size > 0 {
 		st.total.Store(e.Size)
 	}
 	m.dl = st
 
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 		defer cancel()
 
 		rc, size, err := fs.Open(ctx, remote)
@@ -1129,38 +1288,8 @@ func (m *Model) download() tea.Cmd {
 
 // destPath builds a collision free local path inside the loot directory.
 func (m *Model) destPath(name string) string {
-	parts := []string{m.cfg.LootDir}
-	if !m.cfg.Flat {
-		parts = append(parts, sanitizeName(m.browser.hostIP))
-		if m.browser.share != "" {
-			parts = append(parts, sanitizeName(m.browser.share))
-		}
-		for _, seg := range strings.Split(m.browser.path, "/") {
-			if seg = sanitizeName(seg); seg != "" {
-				parts = append(parts, seg)
-			}
-		}
-	}
-	parts = append(parts, sanitizeName(name))
-
-	dest := filepath.Join(parts...)
-	// The extension must come from the filename alone: splitting on the last
-	// dot in the whole path broke on a host IP (its own dots are earlier in
-	// the string than a filename with no extension of its own) and inserted
-	// the "(1)" collision suffix in the middle of the IP address instead of
-	// after the filename.
-	dir, file := filepath.Split(dest)
-	base, ext := file, ""
-	if i := strings.LastIndex(file, "."); i > 0 {
-		base, ext = file[:i], file[i:]
-	}
-	for i := 1; exists(dest); i++ {
-		dest = filepath.Join(dir, fmt.Sprintf("%s (%d)%s", base, i, ext))
-		if i > 500 {
-			break
-		}
-	}
-	return dest
+	parts := append(m.lootParts(m.browser.path), sanitizeName(name))
+	return uniquePath(filepath.Join(parts...))
 }
 
 func exists(p string) bool {

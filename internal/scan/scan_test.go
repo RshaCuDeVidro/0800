@@ -341,3 +341,113 @@ func TestHostViewHelpers(t *testing.T) {
 	}
 	_ = strconv.Itoa(0)
 }
+
+func TestSeverityJSONRoundTrip(t *testing.T) {
+	for _, s := range []Severity{SevInfo, SevLow, SevMedium, SevHigh, SevCritical} {
+		b, err := s.MarshalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got Severity
+		if err := got.UnmarshalJSON(b); err != nil || got != s {
+			t.Errorf("%v -> %s -> %v (%v)", s, b, got, err)
+		}
+	}
+	var s Severity
+	if err := s.UnmarshalJSON([]byte(`"catastrophic"`)); err == nil {
+		t.Error("an unknown severity must be rejected, not silently read as info")
+	}
+}
+
+// TestRestoreAndSkip is --resume: a host finished by an earlier run comes back
+// with its results and counters, is not probed again, and still counts as done.
+func TestRestoreAndSkip(t *testing.T) {
+	prev := &HostView{
+		IP: "10.0.0.1", Ports: []int{445},
+		SMB: &SMBView{Auth: "null", Signing: "disabled"},
+		Findings: []Finding{
+			{Port: 445, Proto: "smb", Kind: "smb-null", Label: "null session", Severity: SevCritical},
+			{Port: 445, Proto: "smb", Kind: "smb-signing", Label: "signing off", Severity: SevLow},
+		},
+	}
+
+	var probed sync.Map
+	cfg := Config{
+		Targets:      []string{"10.0.0.1"},
+		Ports:        []int{445},
+		Skip:         map[string]bool{"10.0.0.1": true},
+		Concurrency:  1,
+		ProbeWorkers: 1,
+		Probe: func(_ context.Context, _ *Engine, ip string, _ int) {
+			probed.Store(ip, true)
+		},
+	}
+	eng := New(cfg)
+	eng.Store().Restore([]*HostView{prev})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := eng.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := probed.Load("10.0.0.1"); ok {
+		t.Error("a skipped host must not be probed again")
+	}
+	snap := eng.Store().Snapshot()
+	if snap.Done != 1 || snap.Total != 1 {
+		t.Errorf("done/total = %d/%d, want 1/1", snap.Done, snap.Total)
+	}
+	if snap.Open != 1 || snap.Findings != 1 {
+		t.Errorf("open=%d findings=%d: the restored counters were not applied", snap.Open, snap.Findings)
+	}
+	h := snap.Hosts[0]
+	if h.Sev != SevCritical || len(h.Tags) == 0 {
+		t.Errorf("derived fields were not recomputed: sev=%v tags=%v", h.Sev, h.Tags)
+	}
+	// The store owns its copy: mutating the source must not reach the snapshot.
+	prev.Findings[0].Label = "mutated"
+	if h.Findings[0].Label != "null session" {
+		t.Error("Restore must copy the views it is given")
+	}
+}
+
+// TestCancelledHostsAreNotCountedAsScanned: workers blocked on the rate gate
+// return from checkPort when the scan is cancelled, and used to call unitDone
+// anyway — so every host that was never dialed was reported as scanned, and a
+// stopped scan looked complete (Done == Total, nothing left to --resume).
+func TestCancelledHostsAreNotCountedAsScanned(t *testing.T) {
+	targets := []string{"192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4", "192.0.2.5", "192.0.2.6"}
+	eng := New(Config{
+		Targets:      targets,
+		Ports:        []int{445},
+		Concurrency:  len(targets),
+		Rate:         1, // one dial a second: five hosts are still waiting when we cancel
+		DialTimeout:  100 * time.Millisecond,
+		ProbeWorkers: 1,
+		Probe:        func(context.Context, *Engine, string, int) {},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+	if err := eng.Run(ctx); err == nil {
+		t.Fatal("a cancelled run must report the cancellation")
+	}
+
+	snap := eng.Store().Snapshot()
+	if snap.Done >= snap.Total {
+		t.Fatalf("done=%d total=%d: hosts that were never dialed were counted as scanned", snap.Done, snap.Total)
+	}
+	pending := 0
+	for _, h := range snap.Hosts {
+		if h.State != StateDone {
+			pending++
+		}
+	}
+	if pending == 0 {
+		t.Error("the unscanned hosts must stay unfinished so --resume can pick them up")
+	}
+}

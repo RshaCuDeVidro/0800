@@ -502,6 +502,35 @@ func (s *Store) Complete() {
 	s.flush()
 }
 
+// Restore seeds hosts from an earlier run (--resume): their views replace the
+// empty ones, derived fields are recomputed, and the global counters account
+// for what they contain. The caller still Finishes them so Done counts them.
+func (s *Store) Restore(prev []*HostView) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range prev {
+		i, ok := s.index[p.IP]
+		if !ok {
+			continue
+		}
+		v := *p
+		v.Ports = append([]int(nil), p.Ports...)
+		v.Findings = append([]Finding(nil), p.Findings...)
+		v.DBs = append([]DBView(nil), p.DBs...)
+		v.Services = append([]ServiceView(nil), p.Services...)
+		v.SMB, v.NFS, v.LDAP = cloneSMB(p.SMB), cloneNFS(p.NFS), cloneLDAP(p.LDAP)
+		if p.FTP != nil {
+			f := *p.FTP
+			v.FTP = &f
+		}
+		derive(&v, s)
+		s.hosts[i] = &v
+		s.open += len(v.Ports)
+		s.findings += v.Discovered()
+	}
+	s.dirty = true
+}
+
 // Len returns the number of hosts in the scan.
 func (s *Store) Len() int {
 	s.mu.Lock()

@@ -65,6 +65,12 @@ type browser struct {
 	entries []remoteEntry
 	shares  []shareItem
 
+	// all* hold the unfiltered listings; entries/shares are what the filter
+	// (key: /) lets through, and what every cursor index refers to.
+	all       []remoteEntry
+	allShares []shareItem
+	filter    string
+
 	cursor  int
 	offset  int
 	loading bool
@@ -185,8 +191,65 @@ func (b *browser) openHost(h *scan.HostView) tea.Cmd {
 	default:
 		b.mode = modeEmpty
 	}
+	b.allShares = append([]shareItem(nil), b.shares...)
 	b.cursor, b.offset = 0, 0
 	return nil
+}
+
+// filterable reports whether the "/" filter applies to what is on screen.
+func (b *browser) filterable() bool { return b.mode == modeDir || b.mode == modeShares }
+
+// setFilter narrows the listing to names containing v (case-insensitive).
+func (b *browser) setFilter(v string) {
+	b.filter = v
+	b.rebuild()
+	b.cursor, b.offset = 0, 0
+}
+
+// rebuild recomputes entries and shares from the unfiltered listings.
+func (b *browser) rebuild() {
+	f := strings.ToLower(b.filter)
+	kept := b.all
+	if f != "" {
+		kept = make([]remoteEntry, 0, len(b.all))
+		for _, e := range b.all {
+			if strings.Contains(strings.ToLower(e.Name), f) {
+				kept = append(kept, e)
+			}
+		}
+	}
+	b.entries = withParent(b.path, kept)
+
+	b.shares = b.allShares
+	if f != "" {
+		b.shares = make([]shareItem, 0, len(b.allShares))
+		for _, s := range b.allShares {
+			if strings.Contains(strings.ToLower(s.Name), f) ||
+				strings.Contains(strings.ToLower(s.Comment), f) {
+				b.shares = append(b.shares, s)
+			}
+		}
+	}
+	if n := b.rows(); b.cursor >= n {
+		b.cursor = max(0, n-1)
+	}
+}
+
+// shareRoot is the printable root of a share on this host.
+func (b *browser) shareRoot(name string) string {
+	if b.proto == "nfs" {
+		return name
+	}
+	return `\\` + b.hostIP + `\` + name
+}
+
+// entryPath is the printable full path of an entry in the current directory.
+func (b *browser) entryPath(name string) string {
+	base := b.absolute()
+	if b.proto == "nfs" {
+		return strings.TrimSuffix(base, "/") + "/" + name
+	}
+	return strings.TrimSuffix(base, `\`) + `\` + name
 }
 
 func (b *browser) rows() int {
@@ -255,7 +318,8 @@ func (b *browser) applyShares(msg sharesMsg) {
 		b.err = msg.err.Error()
 		return
 	}
-	b.shares = msg.shares
+	b.allShares = msg.shares
+	b.rebuild()
 	if b.shareCache == nil {
 		b.shareCache = map[string][]shareItem{}
 	}
@@ -382,7 +446,9 @@ func (b *browser) applyConnected(msg connectedMsg) {
 	b.fs = msg.fs
 	b.share = msg.share
 	b.path = ""
-	b.entries = withParent("", msg.entries)
+	b.filter = ""
+	b.all = msg.entries
+	b.rebuild()
 	b.mode = modeDir
 	b.cursor, b.offset = 0, 0
 	b.err = ""
@@ -395,7 +461,9 @@ func (b *browser) applyListed(msg listedMsg) {
 		return
 	}
 	b.path = msg.path
-	b.entries = withParent(msg.path, msg.entries)
+	b.filter = "" // a filter belongs to one directory
+	b.all = msg.entries
+	b.rebuild()
 	b.cursor, b.offset = 0, 0
 	b.err = ""
 }
@@ -457,9 +525,15 @@ func (b *browser) render(w, h int, focused bool) string {
 	case modeShares:
 		title = b.hostTag
 		right = b.proto + " shares"
+		if b.filter != "" {
+			right = "/" + b.filter + " · " + right
+		}
 	case modeDir:
 		title = b.absolute()
 		right = b.proto
+		if b.filter != "" {
+			right = "/" + b.filter + " · " + right
+		}
 	case modeInfo:
 		title = b.hostTag
 		right = "services"
@@ -496,6 +570,9 @@ func (b *browser) renderList(visible, width int) string {
 	if n == 0 {
 		if b.err != "" {
 			return styleErr.Render("  " + truncate(b.err, width-4))
+		}
+		if b.filter != "" {
+			return styleDim.Render("  nothing matches /" + b.filter)
 		}
 		if b.mode == modeShares {
 			return styleDim.Render("  no shares")

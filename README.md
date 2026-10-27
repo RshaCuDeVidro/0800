@@ -113,7 +113,10 @@ flags:
       --markdown       write a Markdown report
       --html           write a self-contained HTML report
       --checkpoint     autosave the report path(s) above at this interval (default 20s, 0 disables)
+      --resume         continue an interrupted scan from its (partial) JSON report
+      --diff           compare two JSON reports and exit 3 if there is a new finding
       --plain          headless output
+      --no-mouse       do not capture the mouse (keeps terminal text selection)
       --no-color       disable ANSI colours
       --demo           run the TUI with built-in example data
 ```
@@ -122,20 +125,36 @@ Reports: `--json`, `--markdown` and `--html` can be combined; each is written on
 the scan and, unless `--checkpoint 0`, refreshed every 20s while a long scan is still running, so
 killing the process loses at most one interval's worth of results instead of everything.
 
+```bash
+# stop a scan early (x, or Ctrl-C) and pick up only the targets it did not finish
+0800 -t 10.10.0.0/16 --json scan.json
+0800 --resume scan.json --json scan.json
+
+# compare two runs — CI/cron friendly, exit code 3 means something new showed up
+0800 --diff last-week.json scan.json
+```
+
 ### Keys
 
 | Key | Action |
 | --- | --- |
-| `j` / `k`, arrows | move |
-| `enter` or `l` | open host / share / directory |
+| `j` / `k`, arrows, mouse wheel | move / scroll |
+| `enter` or `l`, or click | open host / share / directory |
 | `h` or `esc` | go back one level |
 | `g` | **get** the selected file |
+| `D` | **get** the selected directory, recursively |
+| `p` or `space` | preview a file in place (text or hex dump), no download |
 | `tab` | details pane (findings + evidence) |
 | `s` | exposure summary (severity, top hosts, services) |
-| `e` | export `0800-report.json` + `0800-report.md` |
+| `/` | filter the host list, or the open directory/share list |
+| `v` | severity floor: everything → medium+ → high+ → critical only |
+| `m` | mark / unmark the current host |
+| `e` | export every host as `0800-report.{json,md,html}` |
+| `E` | export only the marked hosts, same formats |
+| `y` | copy the current host IP (or, inside a share, the full remote path) |
 | `o` | cycle sort: ip / severity / findings |
+| `c` | cancel the running download |
 | `x` | stop the running scan (results stay on screen) |
-| `/` | filter hosts by IP, name or tag |
 | `a` | show every target, including silent ones |
 | `r` | reload the current directory |
 | `?` | help |
@@ -143,10 +162,14 @@ killing the process loses at most one interval's worth of results instead of eve
 
 The right pane is a live dashboard with a stream of the newest findings, plus a preview of the
 host under the cursor. Opening an SMB/NFS host splits it into a file tree and that host's
-findings; `s` turns the pane into a report-style summary.
+findings; `s` turns the pane into a report-style summary. `/` filters whichever list has focus —
+hosts, or the directory/share you have open — and clears when you leave it.
 
 Downloads go to `0800-loot/<ip>/<share>/<path>/<file>` (use `--flat` for the current directory).
-Files are written to `.part` and renamed on completion, and existing names get a `(1)` suffix.
+Files are written to `.part` and renamed on completion, and existing names get a `(1)` suffix. A
+recursive download (`D`) walks the directory tree breadth-first and stops at 5000 files, 4 GiB or
+12 levels deep — whichever comes first — skipping (and reporting) anything it could not read
+instead of failing the whole transfer; `c` cancels one in progress.
 
 ## Output
 
@@ -169,7 +192,7 @@ $ 0800 -t 192.0.2.0/24 -p 445,389 --plain
 ```json
 {
   "tool": "0800",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "started": "2026-10-27T12:00:00Z",
   "stats": { "targets": 4, "scanned": 4, "openPorts": 6, "findings": 4, "exposedHosts": 3 },
   "hosts": [
@@ -263,8 +286,8 @@ internal/
   ldap/       BER codec, anonymous bind, root DSE
   nfs/        ONC RPC, MOUNT, NFSv3
   db/         MySQL, PostgreSQL, Redis probes
-  ui/         bubbletea model, theme, browser, details
-  report/     JSON and plain renderers
+  ui/         bubbletea model, theme, browser, preview, recursive download
+  report/     JSON/Markdown/HTML renderers, diff and resume
 tools/
   screenshot/ renders the TUI to SVG for the docs
 ```
@@ -346,14 +369,15 @@ go test -tags integration ./internal/integration -v
 - **SMB signing**: when a server *requires* signing, `0800` reports the requirement and the
   credential result but does not sign requests, so browsing is disabled. Implementing SMB2
   signing/encryption would require session-key derivation and is intentionally out of scope.
-- **Dialects**: the client offers up to SMB 3.0.2. SMB 3.1.1 pre-authentication integrity is not
-  implemented; the server negotiates down.
+- **Dialects**: the default offer stops at SMB 3.0.2, which is what every dialect-sensitive server
+  seen in practice settles on. A server whose minimum protocol is 3.1.1 (it answers
+  `STATUS_NOT_SUPPORTED` to anything older) is retried once with 3.1.1 and the mandatory
+  pre-authentication integrity negotiate context, so it is still fingerprinted and browsed — just
+  without changing what every already-working host negotiates.
 - **NFSv4**: export discovery and reading are NFSv3 (plus a v4 reachability check). NFSv4
   pseudo-filesystems are not traversed.
 - **`srvsvc` enumeration** is best-effort. Some hardened servers deny `NetrShareEnum`; the
   fallback only finds shares whose names are in its list, and costs one round trip per candidate.
-- **NFS directories** larger than a single 64 KiB `READDIRPLUS` reply are truncated at the page
-  boundary.
 - **Kerberos** is fingerprinted by port correlation, not by sending AS-REQs — deliberately, to
   avoid generating authentication events for arbitrary principals.
 - Not a vulnerability scanner: `0800` only answers "is this readable without credentials?".

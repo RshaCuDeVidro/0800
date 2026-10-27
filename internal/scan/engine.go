@@ -26,6 +26,9 @@ type Config struct {
 	// original fail-fast behaviour; raise it on flaky networks where a dial
 	// timeout doesn't necessarily mean the port is closed.
 	Retries int
+	// Skip lists hosts a previous run already finished (--resume): they are
+	// counted as done but not probed again.
+	Skip map[string]bool
 	// EnumShares runs share enumeration (srvsvc) during the scan. The browser
 	// can always enumerate on demand.
 	EnumShares bool
@@ -118,6 +121,10 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	tasks := make([]*hostTask, 0, total)
 	for _, ip := range e.cfg.Targets {
+		if e.cfg.Skip[ip] {
+			e.store.Finish(ip, 0)
+			continue
+		}
 		t := &hostTask{ip: ip, started: time.Now()}
 		t.pending.Store(int32(len(e.cfg.Ports)))
 		tasks = append(tasks, t)
@@ -132,6 +139,11 @@ func (e *Engine) Run(ctx context.Context) error {
 			defer probeWG.Done()
 			for pj := range e.probeCh {
 				e.runProbe(runCtx, pj)
+				if runCtx.Err() != nil {
+					// Cancelled mid-probe: the host is not finished. Counting
+					// it done would report unscanned hosts as scanned.
+					continue
+				}
 				e.unitDone(pj.host)
 			}
 		}()
@@ -148,6 +160,12 @@ func (e *Engine) Run(ctx context.Context) error {
 					return
 				}
 				e.checkPort(runCtx, j.host, j.port)
+				if runCtx.Err() != nil {
+					// Cancelled while waiting on the rate gate or dialing: this
+					// port was never really checked, so the host stays pending
+					// (and --resume will scan it) instead of "done".
+					return
+				}
 				e.unitDone(j.host)
 			}
 		}()

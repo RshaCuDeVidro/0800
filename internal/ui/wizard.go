@@ -405,7 +405,7 @@ func itoa(n int) string { return strconv.Itoa(n) }
 
 // NewWizardPreview builds a wizard for screenshots and docs.
 func NewWizardPreview(w, h int) tea.Model {
-	m := newWizard("0.4.3", Setup{TargetSpec: "10.10.0.0/24", Workers: 1024, WorkersSet: true})
+	m := newWizard("0.5.0", Setup{TargetSpec: "10.10.0.0/24", Workers: 1024, WorkersSet: true})
 	m.w, m.h = w, h
 	m.target.SetValue("10.10.0.0/24")
 	m.setFocus(0)

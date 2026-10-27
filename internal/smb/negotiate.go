@@ -2,15 +2,21 @@ package smb
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"strings"
 	"time"
 )
 
-// smb2Dialects is the offer set. We stop at 3.0.2 on purpose: 3.1.1 requires
-// pre-authentication integrity (negotiate contexts) which adds no value for
-// fingerprinting and would make the client stricter, not more compatible.
+// smb2Dialects is the default offer set. It stops at 3.0.2 on purpose: 3.1.1
+// needs negotiate contexts and would change the dialect every already-working
+// host settles on. Servers that refuse all of these (minimum protocol 3.1.1)
+// are retried on a fresh connection offering smb2Dialects311 — see dialSMB2.
 var smb2Dialects = []uint16{dialect2002, dialect21, dialect30, dialect302}
+
+// smb2Dialects311 is the fallback offer: 3.1.1 only, with the mandatory
+// pre-authentication integrity negotiate context.
+var smb2Dialects311 = []uint16{dialect311}
 
 // negotiateResp holds the parsed NEGOTIATE response.
 type negotiateResp struct {
@@ -25,15 +31,60 @@ type negotiateResp struct {
 }
 
 func (c *conn) negotiateSMB2(ctx context.Context) (*negotiateResp, error) {
-	body := make([]byte, 36+len(smb2Dialects)*2)
+	return c.negotiateSMB2With(ctx, smb2Dialects)
+}
+
+// buildNegotiateRequest builds an SMB2 NEGOTIATE request body (MS-SMB2 2.2.3). When
+// the offer includes 3.1.1 it appends the SMB2_PREAUTH_INTEGRITY_CAPABILITIES
+// negotiate context (2.2.3.1.1), which is mandatory for that dialect.
+func buildNegotiateRequest(dialects []uint16, guid [16]byte) []byte {
+	has311 := false
+	for _, d := range dialects {
+		if d == dialect311 {
+			has311 = true
+		}
+	}
+
+	fixed := 36 + len(dialects)*2
+	ctxOff := align8(smb2HeaderSize+fixed) - smb2HeaderSize // body-relative, 8-aligned
+	size := fixed
+	var contexts []byte
+	if has311 {
+		// ContextType(2) DataLength(2) Reserved(4) | HashAlgorithmCount(2)
+		// SaltLength(2) HashAlgorithms(2) Salt(32)
+		const dataLen = 2 + 2 + 2 + 32
+		contexts = make([]byte, 8+dataLen)
+		putU16(contexts, 0, 0x0001) // SMB2_PREAUTH_INTEGRITY_CAPABILITIES
+		putU16(contexts, 2, dataLen)
+		putU16(contexts, 8, 1)       // one hash algorithm
+		putU16(contexts, 10, 32)     // salt length
+		putU16(contexts, 12, 0x0001) // SHA-512
+		_, _ = rand.Read(contexts[14 : 14+32])
+		size = ctxOff + len(contexts)
+	}
+
+	body := make([]byte, size)
 	putU16(body, 0, 36)
-	putU16(body, 2, uint16(len(smb2Dialects)))
+	putU16(body, 2, uint16(len(dialects)))
 	putU16(body, 4, 0x01) // security mode: signing enabled
 	putU32(body, 8, 0)
-	copy(body[12:28], c.cfg.ClientGUID[:])
-	for i, d := range smb2Dialects {
+	copy(body[12:28], guid[:])
+	if has311 {
+		putU32(body, 28, uint32(smb2HeaderSize+ctxOff)) // NegotiateContextOffset
+		putU16(body, 32, 1)                             // NegotiateContextCount
+	}
+	for i, d := range dialects {
 		putU16(body, 36+i*2, d)
 	}
+	if has311 {
+		copy(body[ctxOff:], contexts)
+	}
+	return body
+}
+
+// negotiateSMB2With negotiates offering exactly the given dialects.
+func (c *conn) negotiateSMB2With(ctx context.Context, dialects []uint16) (*negotiateResp, error) {
+	body := buildNegotiateRequest(dialects, c.cfg.ClientGUID)
 
 	h, resp, err := c.call(ctx, cmdNegotiate, 0, 0, body)
 	if err != nil {
@@ -138,6 +189,8 @@ func dialectName(d uint16) string {
 		return fmt.Sprintf("0x%04x", d)
 	}
 }
+
+func align8(n int) int { return (n + 7) &^ 7 }
 
 func clamp(v, lo, hi uint32) uint32 {
 	if v == 0 {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -41,6 +42,12 @@ func startFakeNFS(t *testing.T) *fakeNFS {
 }
 
 func serveRPC(ln net.Listener, handler func(proc uint32) []byte) {
+	serveRPCArgs(ln, func(proc uint32, _ *xdrReader) []byte { return handler(proc) })
+}
+
+// serveRPCArgs is serveRPC for handlers that need the call arguments (e.g. the
+// cookie of a paged READDIR).
+func serveRPCArgs(ln net.Listener, handler func(proc uint32, args *xdrReader) []byte) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -63,6 +70,10 @@ func serveRPC(ln net.Listener, handler func(proc uint32) []byte) {
 				r.u32() // prog
 				r.u32() // vers
 				proc := r.u32()
+				r.u32() // cred flavor
+				r.skip(int(r.u32()))
+				r.u32() // verifier flavor
+				r.skip(int(r.u32()))
 				w := &xdrWriter{}
 				w.u32(xid)
 				w.u32(1) // reply
@@ -70,7 +81,7 @@ func serveRPC(ln net.Listener, handler func(proc uint32) []byte) {
 				w.u32(0) // verifier flavor
 				w.u32(0)
 				w.u32(0) // success
-				w.b = append(w.b, handler(proc)...)
+				w.b = append(w.b, handler(proc, r)...)
 				hdr := make([]byte, 4)
 				binary.BigEndian.PutUint32(hdr, 0x80000000|uint32(len(w.b)))
 				_, _ = c.Write(append(hdr, w.b...))
@@ -125,6 +136,7 @@ func nfsHandler(proc uint32) []byte {
 		w.u32(0) // no dir attrs
 		w.fixed(make([]byte, 8))
 		w.u32(1)
+		w.u64(7) // fileid (fileid3 is a uint64, RFC 1813)
 		w.str("docs")
 		w.u64(1)
 		w.u32(0)
@@ -135,7 +147,7 @@ func nfsHandler(proc uint32) []byte {
 		w.fixed(make([]byte, 8))
 		// docs (directory)
 		w.u32(1)
-		w.u32(1)
+		w.u64(1) // fileid
 		w.str("docs")
 		w.u64(1)
 		w.u32(1)
@@ -144,7 +156,7 @@ func nfsHandler(proc uint32) []byte {
 		w.opaque([]byte("FH-DOCS"))
 		// readme.txt (file)
 		w.u32(1)
-		w.u32(2)
+		w.u64(2) // fileid
 		w.str("readme.txt")
 		w.u64(2)
 		w.u32(1)
@@ -297,4 +309,136 @@ func FuzzXDRReader(f *testing.F) {
 			r.opaque()
 		}
 	})
+}
+
+// pagedNFS serves a directory of total entries, perPage at a time, honouring
+// the cookie the client sends back (RFC 1813 READDIRPLUS / READDIR paging).
+func pagedNFS(total, perPage int, plus bool) func(proc uint32, args *xdrReader) []byte {
+	verf := []byte("VERF0001")
+	return func(proc uint32, args *xdrReader) []byte {
+		w := &xdrWriter{}
+		switch proc {
+		case nfsProcNull:
+			return nil
+		case nfsProcReaddir, nfsProcReaddirPl:
+			args.opaque() // dir fh
+			cookie := args.u64()
+			if got := args.bytes(8); cookie != 0 && string(got) != string(verf) {
+				w.u32(10003) // NFS3ERR_BAD_COOKIE: client must echo the verifier
+				w.u32(0)
+				return w.b
+			}
+			w.u32(0)
+			w.u32(0) // no dir attrs
+			w.fixed(verf)
+			n := 0
+			for i := int(cookie); i < total && n < perPage; i++ {
+				w.u32(1)
+				w.u64(uint64(100 + i)) // fileid
+				w.str(fmt.Sprintf("file-%04d", i))
+				w.u64(uint64(i + 1)) // cookie: resume after this entry
+				if plus {
+					w.u32(1)
+					writeFattr(w, typeReg, uint64(i))
+					w.u32(0) // no file handle
+				}
+				n++
+			}
+			w.u32(0) // no more entries in this reply
+			if int(cookie)+n >= total {
+				w.u32(1) // eof
+			} else {
+				w.u32(0)
+			}
+		}
+		return w.b
+	}
+}
+
+// startPagedFS mounts a fake export whose root directory has total entries
+// delivered perPage at a time.
+func startPagedFS(t *testing.T, total, perPage int, plus bool) *FS {
+	t.Helper()
+	mountLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nfsLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mountLn.Close(); _ = nfsLn.Close() })
+	go serveRPC(mountLn, mountHandler)
+	go serveRPCArgs(nfsLn, pagedNFS(total, perPage, plus))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	fs, err := MountFS(ctx, "127.0.0.1", Config{
+		Timeout:   2 * time.Second,
+		Port:      uint16(nfsLn.Addr().(*net.TCPAddr).Port),
+		MountPort: uint16(mountLn.Addr().(*net.TCPAddr).Port),
+	}, "/srv/backup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fs.Close() })
+	return fs
+}
+
+// TestReaddirPlusFollowsCookies is the README limitation "directories larger
+// than a single READDIRPLUS reply are truncated": 10 entries, 3 per reply,
+// must come back as 10, in order, with the verifier echoed on every page.
+func TestReaddirPlusFollowsCookies(t *testing.T) {
+	fs := startPagedFS(t, 10, 3, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	entries, err := fs.List(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 10 {
+		t.Fatalf("entries = %d, want 10 (paging stopped early)", len(entries))
+	}
+	seen := map[string]bool{}
+	for _, e := range entries {
+		seen[e.Name] = true
+	}
+	for i := 0; i < 10; i++ {
+		if name := fmt.Sprintf("file-%04d", i); !seen[name] {
+			t.Errorf("missing %s", name)
+		}
+	}
+}
+
+// TestReaddirFallbackFollowsCookies covers the same paging on the plain
+// READDIR path used when READDIRPLUS is unavailable.
+func TestReaddirFallbackFollowsCookies(t *testing.T) {
+	fs := startPagedFS(t, 7, 2, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	names, err := fs.readdirNames(ctx, fs.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 7 {
+		t.Fatalf("names = %d, want 7: %v", len(names), names)
+	}
+}
+
+// TestReaddirNoFileidMisparse pins the wire format: fileid3 is a uint64
+// that precedes the name. A client that reads it as 32 bits (or not at all)
+// parses a real server's reply out of alignment.
+func TestReaddirNoFileidMisparse(t *testing.T) {
+	fs := startPagedFS(t, 2, 10, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	entries, err := fs.List(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Name != "file-0000" || entries[1].Name != "file-0001" {
+		t.Fatalf("entries = %+v", entries)
+	}
 }

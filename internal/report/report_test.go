@@ -172,3 +172,122 @@ func TestWriteMarkdown(t *testing.T) {
 		}
 	}
 }
+
+func TestPartialDocumentAndLoadResume(t *testing.T) {
+	st := scan.NewStore([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil)
+	st.PortOpen("10.0.0.1", 21)
+	st.SetFTP("10.0.0.1", &scan.FTPView{Port: 21, Banner: "hi", AnonOK: true, Code: 230})
+	st.AddFinding("10.0.0.1", scan.Finding{Port: 21, Proto: "ftp", Kind: "ftp-anon", Label: "anonymous login", Severity: scan.SevHigh})
+	st.Finish("10.0.0.1", time.Millisecond)
+	// 10.0.0.3 is mid-probe: it has a partial finding but is not finished.
+	st.PortOpen("10.0.0.3", 445)
+	st.AddFinding("10.0.0.3", scan.Finding{Port: 445, Proto: "smb", Kind: "smb-null", Label: "null session", Severity: scan.SevCritical})
+	st.Refresh()
+
+	doc := Build(st.Snapshot(), "t")
+	if !doc.Partial || len(doc.Pending) != 2 {
+		t.Fatalf("partial=%v pending=%v, want the two unfinished hosts", doc.Partial, doc.Pending)
+	}
+	path := filepath.Join(t.TempDir(), "p.json")
+	if err := WriteJSON(path, doc); err != nil {
+		t.Fatal(err)
+	}
+
+	rs, err := LoadResume(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rs.Targets) != 2 {
+		t.Errorf("targets = %v", rs.Targets)
+	}
+	if len(rs.Done) != 1 || rs.Done[0].IP != "10.0.0.1" {
+		t.Fatalf("done = %+v: the mid-probe host must be re-scanned, not restored", rs.Done)
+	}
+	if rs.Done[0].FTP == nil || !rs.Done[0].FTP.AnonOK || rs.Done[0].Findings[0].Severity != scan.SevHigh {
+		t.Errorf("the restored host lost data in the JSON round trip: %+v", rs.Done[0])
+	}
+}
+
+func TestLoadResumeRejectsCompleteAndForeignFiles(t *testing.T) {
+	dir := t.TempDir()
+	full := filepath.Join(dir, "full.json")
+	if err := WriteJSON(full, Build(sampleSnapshot(), "t")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadResume(full); err == nil || !strings.Contains(err.Error(), "nothing to resume") {
+		t.Errorf("a complete report: %v", err)
+	}
+
+	foreign := filepath.Join(dir, "other.json")
+	if err := os.WriteFile(foreign, []byte(`{"tool":"nmap"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadDocument(foreign); err == nil {
+		t.Error("a report from another tool must be refused")
+	}
+	garbage := filepath.Join(dir, "garbage.json")
+	_ = os.WriteFile(garbage, []byte("not json"), 0o644)
+	if _, err := LoadDocument(garbage); err == nil {
+		t.Error("garbage must be refused")
+	}
+}
+
+func finding(ip string, port int, proto, kind string, sev scan.Severity) scan.Finding {
+	return scan.Finding{Port: port, Proto: proto, Kind: kind, Label: kind, Severity: sev}
+}
+
+func docWith(findings map[string][]scan.Finding) Document {
+	var doc Document
+	doc.Tool = "0800"
+	for ip, fs := range findings {
+		doc.Hosts = append(doc.Hosts, &scan.HostView{IP: ip, Findings: fs})
+	}
+	return doc
+}
+
+func TestDiff(t *testing.T) {
+	old := docWith(map[string][]scan.Finding{
+		"10.0.0.1": {finding("10.0.0.1", 445, "smb", "smb-null", scan.SevCritical), finding("10.0.0.1", 445, "smb", "smb1", scan.SevLow)},
+		"10.0.0.2": {finding("10.0.0.2", 2049, "nfs", "nfs-read", scan.SevHigh)},
+	})
+	cur := docWith(map[string][]scan.Finding{
+		"10.0.0.1": {finding("10.0.0.1", 445, "smb", "smb-null", scan.SevCritical)},
+		"10.0.0.3": {finding("10.0.0.3", 21, "ftp", "ftp-anon", scan.SevHigh), finding("10.0.0.3", 6379, "redis", "redis-open", scan.SevCritical)},
+	})
+
+	d := Diff(old, cur)
+	if len(d.New) != 2 || d.New[0].Kind != "redis-open" {
+		t.Errorf("new = %+v, want 2 findings, most severe (redis) first", d.New)
+	}
+	if len(d.Resolved) != 2 || d.Resolved[0].Kind != "nfs-read" {
+		t.Errorf("resolved = %+v", d.Resolved)
+	}
+	if d.Same != 1 {
+		t.Errorf("same = %d, want 1", d.Same)
+	}
+	if len(d.NewHosts) != 1 || d.NewHosts[0] != "10.0.0.3" || len(d.GoneHosts) != 1 || d.GoneHosts[0] != "10.0.0.2" {
+		t.Errorf("new hosts %v gone hosts %v", d.NewHosts, d.GoneHosts)
+	}
+	if !d.NewExposure() {
+		t.Error("a new critical finding is a new exposure")
+	}
+
+	out := FormatDiff(d, "old.json", "new.json")
+	for _, want := range []string{"2 new", "2 resolved", "1 unchanged", "10.0.0.3", "redis-open", "no longer exposed: 10.0.0.2"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("diff output misses %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestDiffLowSeverityIsNotAnExposure(t *testing.T) {
+	old := docWith(nil)
+	cur := docWith(map[string][]scan.Finding{"10.0.0.1": {finding("10.0.0.1", 445, "smb", "smb1", scan.SevLow)}})
+	d := Diff(old, cur)
+	if len(d.New) != 1 || d.NewExposure() {
+		t.Errorf("a new low finding must show up but not trip the alert: %+v", d)
+	}
+	if out := FormatDiff(Diff(old, old), "a", "b"); !strings.Contains(out, "no change in exposure") {
+		t.Errorf("identical reports: %s", out)
+	}
+}

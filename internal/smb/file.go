@@ -235,9 +235,11 @@ func (r *fileReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Close releases the remote handle.
+// Close releases the remote handle and the tree connect Client.Open made for
+// it; leaving the tree behind leaked one per opened file until logoff.
 func (r *fileReader) Close() error {
 	r.c.closeFile(context.Background(), r.treeID, r.id)
+	r.c.treeDisconnect(context.Background(), r.treeID)
 	return nil
 }
 

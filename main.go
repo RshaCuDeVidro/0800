@@ -8,8 +8,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -27,7 +29,7 @@ import (
 	"golang.org/x/term"
 )
 
-var version = "0.4.3"
+var version = "0.5.0"
 
 type stringList []string
 
@@ -37,8 +39,16 @@ func (s *stringList) Set(v string) error {
 	return nil
 }
 
+// errNewExposure makes --diff exit with status 3 when the new report holds a
+// finding the old one did not (medium or above), so a cron job or CI step can
+// alert on it. The diff itself has already been printed.
+var errNewExposure = errors.New("new exposure")
+
 func main() {
 	if err := run(); err != nil {
+		if errors.Is(err, errNewExposure) {
+			os.Exit(3)
+		}
 		fmt.Fprintln(os.Stderr, "0800:", err)
 		os.Exit(1)
 	}
@@ -69,6 +79,9 @@ func run() error {
 		menu        = flag.Bool("menu", false, "always show the interactive setup screen")
 		noMenu      = flag.Bool("no-menu", false, "skip the interactive setup screen")
 		noColor     = flag.Bool("no-color", false, "disable ANSI colours")
+		diffMode    = flag.Bool("diff", false, "compare two JSON reports: 0800 --diff old.json new.json (exit 3 on new exposure)")
+		resumePath  = flag.String("resume", "", "continue an interrupted scan from its (partial) JSON report")
+		noMouse     = flag.Bool("no-mouse", false, "do not capture the mouse (keeps terminal text selection)")
 		demo        = flag.Bool("demo", false, "run the TUI with built-in example data")
 		width       = flag.Int("width", 0, "override terminal width (demo/screenshots)")
 		height      = flag.Int("height", 0, "override terminal height (demo/screenshots)")
@@ -91,6 +104,22 @@ func run() error {
 	}
 	if *demo {
 		return runDemo(*width, *height)
+	}
+	if *diffMode {
+		return runDiff(flag.Args())
+	}
+
+	var rs *report.Resume
+	if *resumePath != "" {
+		r, err := report.LoadResume(*resumePath)
+		if err != nil {
+			return err
+		}
+		rs = &r
+		if len(targets) > 0 {
+			fmt.Fprintln(os.Stderr, "0800: --resume continues the report's own target list; ignoring -t")
+		}
+		targets = stringList{"(resume)"}
 	}
 
 	setFlags := map[string]bool{}
@@ -117,7 +146,7 @@ func run() error {
 	// The setup screen is the default when a terminal is attached, even if -t
 	// was given (it is prefilled). Scripts use --no-menu or a pipe.
 	interactive := term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
-	showMenu := *menu || (interactive && !*noMenu && !*plain)
+	showMenu := (*menu || (interactive && !*noMenu && !*plain)) && rs == nil
 	if showMenu {
 		if !interactive {
 			return errors.New("interactive setup needs a terminal (use --no-menu for scripts)")
@@ -171,19 +200,29 @@ func run() error {
 		return errors.New("no targets given (use -t or positional arguments)")
 	}
 
-	ips, err := target.Parse(targets, target.Options{
-		Max:     *maxHosts,
-		Exclude: exclude,
-		Resolve: true,
-	})
-	if errors.Is(err, target.ErrTooMany) {
-		return fmt.Errorf("%w — lower the scope or raise --max-hosts", err)
-	}
-	if err != nil {
-		return err
-	}
-	if len(ips) == 0 {
-		return errors.New("every target was excluded")
+	var (
+		ips  []string
+		skip map[string]bool
+	)
+	if rs != nil {
+		ips, skip = resumeTargets(rs)
+		fmt.Fprintf(os.Stderr, "resuming %s: %d target(s) left, %d host(s) with results restored\n",
+			*resumePath, len(rs.Targets), len(rs.Done))
+	} else {
+		ips, err = target.Parse(targets, target.Options{
+			Max:     *maxHosts,
+			Exclude: exclude,
+			Resolve: true,
+		})
+		if errors.Is(err, target.ErrTooMany) {
+			return fmt.Errorf("%w — lower the scope or raise --max-hosts", err)
+		}
+		if err != nil {
+			return err
+		}
+		if len(ips) == 0 {
+			return errors.New("every target was excluded")
+		}
 	}
 
 	smbCfg := smb.DefaultConfig()
@@ -206,6 +245,7 @@ func run() error {
 		ProbeWorkers: *probes,
 		Rate:         *rate,
 		Retries:      *retries,
+		Skip:         skip,
 		ServicePorts: servicePorts,
 		EnumShares:   *enumShares,
 	}
@@ -215,6 +255,9 @@ func run() error {
 			fmt.Printf("%s %s\n", severityPrefix(h), report.PlainLine(h))
 		}
 		eng := scan.New(cfg)
+		if rs != nil {
+			eng.Store().Restore(rs.Done)
+		}
 		scanCtx, cancelScan := context.WithCancel(ctx)
 		stopCheckpoint := startCheckpointer(scanCtx, eng, version, *checkpoint, *jsonPath, *mdPath, *htmlPath)
 		err := eng.Run(scanCtx)
@@ -231,6 +274,9 @@ func run() error {
 
 	scanCtx, cancelScan := context.WithCancel(ctx)
 	eng := scan.New(cfg)
+	if rs != nil {
+		eng.Store().Restore(rs.Done)
+	}
 	stopCheckpoint := startCheckpointer(scanCtx, eng, version, *checkpoint, *jsonPath, *mdPath, *htmlPath)
 	// A single defer, in this order: cancelScan must run before stopCheckpoint
 	// blocks on it, on every exit path (including an early return from
@@ -256,7 +302,11 @@ func run() error {
 		}
 	}()
 
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	progOpts := []tea.ProgramOption{tea.WithAltScreen()}
+	if !*noMouse {
+		progOpts = append(progOpts, tea.WithMouseCellMotion())
+	}
+	p := tea.NewProgram(model, progOpts...)
 	go func() {
 		<-ctx.Done()
 		p.Quit()
@@ -274,6 +324,48 @@ func run() error {
 		}
 	}
 	return nil
+}
+
+// runDiff prints what changed between two saved reports.
+func runDiff(args []string) error {
+	if len(args) != 2 {
+		return errors.New("usage: 0800 --diff <old.json> <new.json>")
+	}
+	oldDoc, err := report.LoadDocument(args[0])
+	if err != nil {
+		return err
+	}
+	newDoc, err := report.LoadDocument(args[1])
+	if err != nil {
+		return err
+	}
+	d := report.Diff(oldDoc, newDoc)
+	fmt.Print(report.FormatDiff(d, args[0], args[1]))
+	if d.NewExposure() {
+		return errNewExposure
+	}
+	return nil
+}
+
+// resumeTargets merges the pending targets with the hosts whose results are
+// restored (they must be in the store to appear in the final report), sorted,
+// and returns the set of hosts the engine must not probe again.
+func resumeTargets(rs *report.Resume) ([]string, map[string]bool) {
+	skip := make(map[string]bool, len(rs.Done))
+	all := append([]string(nil), rs.Targets...)
+	for _, h := range rs.Done {
+		skip[h.IP] = true
+		all = append(all, h.IP)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		a, errA := netip.ParseAddr(all[i])
+		b, errB := netip.ParseAddr(all[j])
+		if errA != nil || errB != nil {
+			return all[i] < all[j]
+		}
+		return a.Less(b)
+	})
+	return all, skip
 }
 
 // writeReports writes every report format the caller asked for (an empty

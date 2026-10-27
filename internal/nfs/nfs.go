@@ -148,12 +148,15 @@ func countEntries(ctx context.Context, host string, port uint16, fh []byte, time
 		return 0
 	}
 	r.postOpAttr()
-	r.skip(8)
+	r.skip(8) // cookieverf
 	n := 0
 	for r.u32() == 1 {
-		r.str()
-		r.u64()
-		n++
+		r.u64() // fileid (fileid3 is a uint64, RFC 1813 3.3.16)
+		name := r.str()
+		r.u64() // cookie
+		if name != "." && name != ".." {
+			n++
+		}
 		if n > 500 {
 			break
 		}
@@ -272,81 +275,100 @@ func (f *FS) resolve(ctx context.Context, path string) ([]byte, error) {
 	return fh, nil
 }
 
-func (f *FS) readdirPlus(ctx context.Context, fh []byte) ([]Entry, error) {
-	w := &xdrWriter{}
-	w.opaque(fh)
-	w.u64(0)
-	w.fixed(make([]byte, 8))
-	w.u32(8192)  // dircount
-	w.u32(65536) // maxcount
+// Directory paging limits. A hostile or enormous directory must not be able
+// to exhaust memory, and a server that ignores cookies must not loop us.
+const (
+	maxDirPages   = 4096
+	maxDirEntries = 100000
+	// readdirNameCap bounds the plain-READDIR fallback, which needs two extra
+	// round trips (LOOKUP + GETATTR) per name.
+	readdirNameCap = 1000
+)
 
-	body, err := f.c.call(ctx, progNFS, versNFS, nfsProcReaddirPl, w.b)
-	if err != nil {
-		return nil, err
-	}
-	r := &xdrReader{b: body}
-	if st := r.u32(); st != 0 {
-		return nil, fmt.Errorf("nfs: readdirplus: status %d", st)
-	}
-	r.postOpAttr()
-	r.skip(8) // cookieverf
-	var out []Entry
-	for r.u32() == 1 {
-		r.u32() // fileid
-		name := r.str()
-		r.u64() // cookie
-		a, ok := r.postOpAttr()
-		if r.u32() == 1 { // post_op_fh3
-			r.opaque()
+// readdirPlus lists a directory with READDIRPLUS, following the cookie and
+// cookieverf across as many replies as the server needs (RFC 1813 3.3.17).
+// If a later page fails, the entries gathered so far are returned: a partial
+// listing is more useful to a human than none.
+func (f *FS) readdirPlus(ctx context.Context, fh []byte) ([]Entry, error) {
+	var (
+		out    []Entry
+		cookie uint64
+		verf   = make([]byte, 8)
+	)
+	for page := 0; page < maxDirPages; page++ {
+		w := &xdrWriter{}
+		w.opaque(fh)
+		w.u64(cookie)
+		w.fixed(verf)
+		w.u32(8192)  // dircount
+		w.u32(65536) // maxcount
+
+		body, err := f.c.call(ctx, progNFS, versNFS, nfsProcReaddirPl, w.b)
+		if err != nil {
+			if page > 0 {
+				return out, nil
+			}
+			return nil, err
 		}
-		if r.err != nil {
+		r := &xdrReader{b: body}
+		if st := r.u32(); st != 0 {
+			if page > 0 {
+				return out, nil
+			}
+			return nil, fmt.Errorf("nfs: readdirplus: status %d", st)
+		}
+		r.postOpAttr()
+		verf = r.bytes(8)
+
+		last, got := cookie, 0
+		for r.u32() == 1 {
+			r.u64() // fileid (fileid3 is a uint64)
+			name := r.str()
+			ck := r.u64()
+			a, ok := r.postOpAttr()
+			if r.u32() == 1 { // post_op_fh3
+				r.opaque()
+			}
+			if r.err != nil {
+				if page > 0 || len(out) > 0 {
+					return out, nil
+				}
+				return out, r.err
+			}
+			last = ck
+			got++
+			if name == "." || name == ".." || name == "" {
+				continue
+			}
+			e := Entry{Name: name}
+			if ok {
+				e.Dir = a.Type == typeDir
+				e.Size = int64(a.Size)
+				e.ModTime = a.Mtime
+			}
+			out = append(out, e)
+			if len(out) >= maxDirEntries {
+				return out, nil
+			}
+		}
+		eof := r.u32() == 1
+		if r.err != nil && len(out) == 0 {
 			return out, r.err
 		}
-		if name == "." || name == ".." || name == "" {
-			continue
-		}
-		e := Entry{Name: name}
-		if ok {
-			e.Dir = a.Type == typeDir
-			e.Size = int64(a.Size)
-			e.ModTime = a.Mtime
-		}
-		out = append(out, e)
-	}
-	return out, r.err
-}
-
-// readdir is the fallback for servers that do not implement READDIRPLUS.
-func (f *FS) readdir(ctx context.Context, dir string, fh []byte) ([]Entry, error) {
-	w := &xdrWriter{}
-	w.opaque(fh)
-	w.u64(0)
-	w.fixed(make([]byte, 8))
-	w.u32(32768)
-
-	body, err := f.c.call(ctx, progNFS, versNFS, nfsProcReaddir, w.b)
-	if err != nil {
-		return nil, err
-	}
-	r := &xdrReader{b: body}
-	if st := r.u32(); st != 0 {
-		return nil, fmt.Errorf("nfs: readdir: status %d", st)
-	}
-	r.postOpAttr()
-	r.skip(8)
-	var names []string
-	for r.u32() == 1 {
-		name := r.str()
-		r.u64()
-		if name != "." && name != ".." && name != "" {
-			names = append(names, name)
-		}
-		if len(names) >= 400 {
+		if eof || got == 0 || last == cookie {
 			break
 		}
+		cookie = last
 	}
-	if r.err != nil {
-		return nil, r.err
+	return out, nil
+}
+
+// readdir is the fallback for servers that do not implement READDIRPLUS. It
+// pages with READDIR and then resolves each name with LOOKUP + GETATTR.
+func (f *FS) readdir(ctx context.Context, dir string, fh []byte) ([]Entry, error) {
+	names, err := f.readdirNames(ctx, fh)
+	if err != nil {
+		return nil, err
 	}
 	out := make([]Entry, 0, len(names))
 	for _, n := range names {
@@ -367,6 +389,67 @@ func (f *FS) readdir(ctx context.Context, dir string, fh []byte) ([]Entry, error
 		out = append(out, Entry{Name: n, Dir: a.Type == typeDir, Size: int64(a.Size), ModTime: a.Mtime})
 	}
 	return out, nil
+}
+
+// readdirNames lists the bare names in a directory with READDIR, following
+// the cookie and cookieverf across replies (RFC 1813 3.3.16).
+func (f *FS) readdirNames(ctx context.Context, fh []byte) ([]string, error) {
+	var (
+		names  []string
+		cookie uint64
+		verf   = make([]byte, 8)
+	)
+	for page := 0; page < maxDirPages && len(names) < readdirNameCap; page++ {
+		w := &xdrWriter{}
+		w.opaque(fh)
+		w.u64(cookie)
+		w.fixed(verf)
+		w.u32(32768)
+
+		body, err := f.c.call(ctx, progNFS, versNFS, nfsProcReaddir, w.b)
+		if err != nil {
+			if page > 0 {
+				break
+			}
+			return nil, err
+		}
+		r := &xdrReader{b: body}
+		if st := r.u32(); st != 0 {
+			if page > 0 {
+				break
+			}
+			return nil, fmt.Errorf("nfs: readdir: status %d", st)
+		}
+		r.postOpAttr()
+		verf = r.bytes(8)
+
+		last, got := cookie, 0
+		for r.u32() == 1 {
+			r.u64() // fileid (fileid3 is a uint64)
+			name := r.str()
+			ck := r.u64()
+			if r.err != nil {
+				break
+			}
+			last = ck
+			got++
+			if name != "." && name != ".." && name != "" {
+				names = append(names, name)
+			}
+			if len(names) >= readdirNameCap {
+				break
+			}
+		}
+		eof := r.u32() == 1
+		if r.err != nil && len(names) == 0 {
+			return nil, r.err
+		}
+		if eof || got == 0 || last == cookie {
+			break
+		}
+		cookie = last
+	}
+	return names, nil
 }
 
 func (f *FS) getattr(ctx context.Context, fh []byte) (FileAttr, error) {
@@ -402,6 +485,30 @@ func (f *FS) Open(ctx context.Context, path string) (io.ReadCloser, int64, error
 	}
 	ctx = context.WithoutCancel(ctx)
 	return &fileReader{fs: f, ctx: ctx, fh: fh, size: int64(a.Size)}, int64(a.Size), nil
+}
+
+// Peek reads at most n bytes from the start of a file in one READ and returns
+// the file size, so a preview costs a single round trip.
+func (f *FS) Peek(ctx context.Context, path string, n int) ([]byte, int64, error) {
+	path = cleanPath(path)
+	fh, err := f.resolve(ctx, path)
+	if err != nil {
+		return nil, 0, err
+	}
+	a, ok := f.attrs[path]
+	if !ok {
+		if a, err = f.getattr(ctx, fh); err != nil {
+			return nil, 0, err
+		}
+	}
+	if a.Type == typeDir {
+		return nil, 0, errors.New("nfs: is a directory")
+	}
+	if n <= 0 || a.Size == 0 {
+		return nil, int64(a.Size), nil
+	}
+	data, _, err := f.readAt(ctx, fh, 0, uint32(n))
+	return data, int64(a.Size), err
 }
 
 type fileReader struct {

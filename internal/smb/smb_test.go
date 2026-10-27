@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,6 +24,12 @@ type fakeSMB struct {
 	guestOK  bool
 	conns    atomic.Int32
 
+	// min311 models a server whose minimum protocol is SMB 3.1.1: a NEGOTIATE
+	// that does not offer it gets STATUS_NOT_SUPPORTED, and one that does must
+	// carry the pre-authentication integrity context.
+	openTrees  atomic.Int32 // tree connects not yet disconnected
+	min311     bool
+	ctxChecked atomic.Bool // set once a valid 3.1.1 request was seen
 	// quirkyCreate makes the share-root CREATE fail with
 	// STATUS_INVALID_PARAMETER when CreateOptions is non-zero, mimicking the
 	// embedded NAS stacks that reject FILE_DIRECTORY_FILE|FILE_SYNCHRONOUS_IO_NONALERT.
@@ -88,6 +96,27 @@ func (f *fakeSMB) handle(c net.Conn) {
 
 		switch h.Command {
 		case cmdNegotiate:
+			if f.min311 {
+				offered311 := false
+				for i := 0; i < int(u16(body, 2)); i++ {
+					if u16(body, 36+i*2) == dialect311 {
+						offered311 = true
+					}
+				}
+				if !offered311 {
+					f.reply(c, cmdNegotiate, StatusNotSupported, h.MessageID, 0, 0, nil)
+					continue
+				}
+				if !validPreauthContext(body) {
+					f.reply(c, cmdNegotiate, StatusInvalidParameter, h.MessageID, 0, 0, nil)
+					continue
+				}
+				f.ctxChecked.Store(true)
+				resp := negotiateBody(f.signMode)
+				putU16(resp, 4, dialect311)
+				f.reply(c, cmdNegotiate, StatusSuccess, h.MessageID, 0, 0, resp)
+				continue
+			}
 			f.reply(c, cmdNegotiate, StatusSuccess, h.MessageID, 0, 0, negotiateBody(f.signMode))
 
 		case cmdSessionSetup:
@@ -124,6 +153,7 @@ func (f *fakeSMB) handle(c net.Conn) {
 				putU16(resp, 0, 16)
 				resp[2] = 1 // disk
 				putU32(resp, 12, 0x001F01FF)
+				f.openTrees.Add(1)
 				f.reply(c, cmdTreeConnect, StatusSuccess, h.MessageID, session, 1, resp)
 			} else {
 				f.reply(c, cmdTreeConnect, StatusBadNetworkName, h.MessageID, session, 0, nil)
@@ -168,6 +198,9 @@ func (f *fakeSMB) handle(c net.Conn) {
 			f.reply(c, cmdQueryDirectory, StatusSuccess, h.MessageID, session, h.TreeID, resp)
 
 		case cmdClose, cmdTreeDisconnect, cmdLogoff:
+			if h.Command == cmdTreeDisconnect {
+				f.openTrees.Add(-1)
+			}
 			size := 4
 			if h.Command == cmdClose {
 				size = 60
@@ -316,6 +349,28 @@ func dirEntry(name string, attrs uint32, size uint64) []byte {
 	putU64(b, 24, 133000000000000000) // mtime
 	copy(b[104:], u)
 	return b
+}
+
+// validPreauthContext checks the NEGOTIATE request carries exactly what
+// MS-SMB2 2.2.3.1.1 requires for 3.1.1: one SMB2_PREAUTH_INTEGRITY_CAPABILITIES
+// context, 8-byte aligned, offering SHA-512 with a 32-byte salt.
+func validPreauthContext(body []byte) bool {
+	off := int(u32(body, 28)) - smb2HeaderSize
+	if u16(body, 32) != 1 || off < 36 || off%8 != (smb2HeaderSize%8) || off+8 > len(body) {
+		return false
+	}
+	if (int(u32(body, 28)))%8 != 0 {
+		return false
+	}
+	ctx := body[off:]
+	if u16(ctx, 0) != 0x0001 {
+		return false
+	}
+	dataLen := int(u16(ctx, 2))
+	if dataLen < 38 || 8+dataLen > len(ctx) {
+		return false
+	}
+	return u16(ctx, 8) == 1 && u16(ctx, 10) == 32 && u16(ctx, 12) == 0x0001
 }
 
 // --- tests ----------------------------------------------------------------
@@ -771,4 +826,152 @@ func FuzzParseShareEnum(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_, _ = ndrParseShareEnum(data)
 	})
+}
+
+// TestNegotiateFallsBackTo311 is the README limitation "SMB 3.1.1 ... is not
+// implemented": a server with a 3.1.1 minimum refuses the default offer, and
+// the client must retry offering 3.1.1 with the pre-auth integrity context.
+func TestNegotiateFallsBackTo311(t *testing.T) {
+	f := startFake(t, 0x01)
+	f.min311 = true
+	host, port := f.addr()
+
+	cfg := DefaultConfig()
+	cfg.Port = port
+	cfg.IOTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	p, err := ProbeHost(ctx, host, cfg)
+	if err != nil {
+		t.Fatalf("probe against a 3.1.1-only server: %v", err)
+	}
+	if p.Dialect != "3.1.1" {
+		t.Errorf("dialect = %q, want 3.1.1", p.Dialect)
+	}
+	if !f.ctxChecked.Load() {
+		t.Error("server never saw a valid pre-auth integrity negotiate context")
+	}
+	if p.AuthKind() != "null" {
+		t.Errorf("auth = %q, want null: %+v", p.AuthKind(), p.Auth)
+	}
+}
+
+func TestNegotiateRequestShape(t *testing.T) {
+	var guid [16]byte
+	// Without 3.1.1 the request must stay the classic layout: no contexts and
+	// ClientStartTime (offsets 28..35) all zero.
+	plain := buildNegotiateRequest(smb2Dialects, guid)
+	if got := len(plain); got != 36+2*len(smb2Dialects) {
+		t.Errorf("plain request length = %d", got)
+	}
+	if u32(plain, 28) != 0 || u16(plain, 32) != 0 {
+		t.Error("a request without 3.1.1 must not carry negotiate contexts")
+	}
+
+	body := buildNegotiateRequest(smb2Dialects311, guid)
+	if !validPreauthContext(body) {
+		t.Errorf("3.1.1 request has a malformed pre-auth context: %x", body)
+	}
+}
+
+func TestRefusedDialects(t *testing.T) {
+	for err, want := range map[error]bool{
+		StatusNotSupported:      true,
+		io.EOF:                  true,
+		io.ErrUnexpectedEOF:     true,
+		StatusAccessDenied:      false,
+		errShortFrame:           false,
+		errors.New("bad frame"): false,
+	} {
+		if got := refusedDialects(err); got != want {
+			t.Errorf("refusedDialects(%v) = %v, want %v", err, got, want)
+		}
+	}
+}
+
+// TestOpenDoesNotLeakTreeConnects: every Client.Open made its own tree
+// connect and Close only released the file handle, so opening many files
+// (previews, recursive downloads) piled up trees on the session.
+func TestOpenDoesNotLeakTreeConnects(t *testing.T) {
+	f := startFake(t, 0x01)
+	host, port := f.addr()
+	cfg := DefaultConfig()
+	cfg.Port = port
+	cfg.IOTimeout = 2 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	c, err := Connect(ctx, host, "null", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	base := f.openTrees.Load()
+	for i := 0; i < 5; i++ {
+		rc, _, err := c.Open(ctx, "public", "readme.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadAll(rc); err != nil {
+			t.Fatal(err)
+		}
+		_ = rc.Close()
+	}
+	if got := f.openTrees.Load(); got != base {
+		t.Errorf("open trees = %d after 5 open/close cycles, want %d (leak)", got, base)
+	}
+}
+
+// TestConcurrentCallsOnOneSession reproduces the TUI pattern: a download
+// streams in one goroutine while the user keeps listing directories on the
+// same connection. Unserialised, frames interleave and a response is dropped.
+func TestConcurrentCallsOnOneSession(t *testing.T) {
+	f := startFake(t, 0x01)
+	host, port := f.addr()
+	cfg := DefaultConfig()
+	cfg.Port = port
+	cfg.IOTimeout = 3 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	c, err := Connect(ctx, host, "null", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 64)
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				if g%2 == 0 {
+					if _, err := c.ReadDir(ctx, "public", ""); err != nil {
+						errs <- err
+						return
+					}
+					continue
+				}
+				rc, _, err := c.Open(ctx, "public", "readme.txt")
+				if err != nil {
+					errs <- err
+					return
+				}
+				if _, err := io.ReadAll(rc); err != nil {
+					errs <- err
+				}
+				_ = rc.Close()
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent call failed: %v", err)
+	}
 }
