@@ -305,3 +305,26 @@ func BenchmarkRefreshBigList(b *testing.B) {
 		m.refresh()
 	}
 }
+
+func TestPrettyFS(t *testing.T) {
+	cases := map[string]string{
+		"smb: STATUS_INVALID_PARAMETER": "this share cannot be listed as a file tree (invalid parameter)",
+		"STATUS_ACCESS_DENIED":          "access denied by the server",
+		"read tcp: i/o timeout":         "server stopped answering",
+	}
+	for in, want := range cases {
+		if got := prettyFS(in); got != want {
+			t.Errorf("prettyFS(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestPipeShareIsNotOpened(t *testing.T) {
+	b := &browser{mode: modeShares, shares: []shareItem{{Name: "IPC$", Type: "pipe"}}}
+	if cmd := b.open(); cmd != nil {
+		t.Fatal("pipe shares must not start a session")
+	}
+	if b.err == "" || !strings.Contains(b.err, "named pipe") {
+		t.Fatalf("err = %q", b.err)
+	}
+}

@@ -656,3 +656,10 @@ func TestNDRParseRealResponse(t *testing.T) {
 		t.Errorf("share[1] = %+v", shares[1])
 	}
 }
+
+func FuzzParseShareEnum(f *testing.F) {
+	f.Add([]byte{1, 0, 0, 0, 1, 0, 0, 0, 4, 0, 2, 0})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = ndrParseShareEnum(data)
+	})
+}

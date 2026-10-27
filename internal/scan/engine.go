@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -205,7 +206,7 @@ func (e *Engine) checkPort(ctx context.Context, h *hostTask, port int) {
 func (e *Engine) runProbe(ctx context.Context, pj probeJob) {
 	defer func() {
 		if r := recover(); r != nil {
-			e.store.SetError(pj.host.ip, fmt.Sprintf("probe panic on %d: %v", pj.port, r))
+			e.store.SetError(pj.host.ip, fmt.Sprintf("probe panic on %d: %v\n%s", pj.port, r, debug.Stack()))
 		}
 	}()
 

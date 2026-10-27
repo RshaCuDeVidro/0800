@@ -30,6 +30,10 @@ func renderSelection(host *scan.HostView, w, height int, focused bool) string {
 	}
 	lines = append(lines, "")
 
+	if host.Err != "" {
+		lines = append(lines, styleErr.Render("error: "+strings.SplitN(host.Err, "\n", 2)[0]))
+		lines = append(lines, "")
+	}
 	lines = append(lines, findingLines(host, innerW)...)
 
 	// Show the service fingerprints when there is no finding to explain.

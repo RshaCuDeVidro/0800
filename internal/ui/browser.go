@@ -187,6 +187,23 @@ func (b *browser) rows() int {
 	return 0
 }
 
+// prettyFS turns common SMB statuses into something a human can act on.
+func prettyFS(s string) string {
+	switch {
+	case strings.Contains(s, "STATUS_INVALID_PARAMETER"):
+		return "this share cannot be listed as a file tree (invalid parameter)"
+	case strings.Contains(s, "STATUS_ACCESS_DENIED"):
+		return "access denied by the server"
+	case strings.Contains(s, "STATUS_BAD_NETWORK_NAME"):
+		return "share no longer available"
+	case strings.Contains(s, "STATUS_OBJECT_NAME_NOT_FOUND"):
+		return "directory not found"
+	case strings.Contains(s, "i/o timeout"), strings.Contains(s, "deadline exceeded"):
+		return "server stopped answering"
+	}
+	return s
+}
+
 func sortShares(list []shareItem) {
 	sort.Slice(list, func(i, j int) bool {
 		return strings.ToLower(list[i].Name) < strings.ToLower(list[j].Name)
@@ -294,6 +311,10 @@ func (b *browser) open() tea.Cmd {
 			return nil
 		}
 		item := b.shares[b.cursor]
+		if item.Type == "pipe" {
+			b.err = item.Name + " is a named pipe, not a browsable share"
+			return nil
+		}
 		b.loading = true
 		b.err = ""
 		return b.connectCmd(item)
@@ -463,16 +484,21 @@ func (b *browser) renderList(visible, width int) string {
 	if b.loading {
 		return styleDim.Render("  loading…")
 	}
-	if b.err != "" {
-		return styleErr.Render("  " + truncate(b.err, width-4))
-	}
-
 	n := b.rows()
 	if n == 0 {
+		if b.err != "" {
+			return styleErr.Render("  " + truncate(b.err, width-4))
+		}
 		if b.mode == modeShares {
 			return styleDim.Render("  no shares")
 		}
 		return styleDim.Render("  empty directory")
+	}
+
+	var prefix string
+	if b.err != "" {
+		prefix = styleErr.Render("  "+truncate(prettyFS(b.err), width-4)) + "\n"
+		visible = max(1, visible-1)
 	}
 
 	if b.cursor >= n {
@@ -490,7 +516,7 @@ func (b *browser) renderList(visible, width int) string {
 		selected := i == b.cursor
 		lines = append(lines, b.rowLine(i, selected, width))
 	}
-	return strings.Join(lines, "\n")
+	return prefix + strings.Join(lines, "\n")
 }
 
 func (b *browser) rowLine(i int, selected bool, width int) string {
