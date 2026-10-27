@@ -3,8 +3,12 @@ package smb
 import (
 	"bytes"
 	"crypto/des"
+	"crypto/hmac"
+	"crypto/md5"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"strings"
 	"time"
 )
 
@@ -16,17 +20,18 @@ var ntlmSignature = []byte("NTLMSSP\x00")
 
 // Challenge is the parsed NTLMSSP Type 2 message.
 type Challenge struct {
-	Flags      uint32
-	Server     [8]byte
-	Target     string
-	Identity   ServerIdentity
-	TargetInfo map[uint16][]byte
+	Flags         uint32
+	Server        [8]byte
+	Target        string
+	Identity      ServerIdentity
+	TargetInfo    map[uint16][]byte
+	TargetInfoRaw []byte
 }
 
 // negoType1 builds the NTLMSSP NEGOTIATE message. Signing and sealing are
 // deliberately not requested: this client never signs.
 func negoType1() []byte {
-	const flags = 0xA0080207 // unicode|oem|request-target|ntlm|target-info|128|56
+	const flags = 0xA0088207 // unicode|oem|request-target|ntlm|ess|target-info|128|56
 	b := make([]byte, 32)
 	copy(b, ntlmSignature)
 	putU32(b, 8, 1)
@@ -59,6 +64,7 @@ func parseType2(blob []byte) (*Challenge, bool) {
 	}
 
 	if n, off := int(u16(blob, 40)), int(u32(blob, 44)); n > 0 && off+n <= len(blob) {
+		ch.TargetInfoRaw = append([]byte(nil), blob[off:off+n]...)
 		parseAVPairs(blob[off:off+n], ch)
 	}
 	return ch, true
@@ -107,7 +113,11 @@ func type3(user, domain string, ch *Challenge, anonymous bool) []byte {
 
 	var ntB []byte
 	if !anonymous {
-		ntB = ntResponseEmptyPassword(ch.Server)
+		if len(ch.TargetInfoRaw) > 0 {
+			ntB = ntlmv2Response(ch, user, domain)
+		} else {
+			ntB = ntResponseEmptyPassword(ch.Server)
+		}
 	}
 
 	off := 64
@@ -146,7 +156,11 @@ func type3(user, domain string, ch *Challenge, anonymous bool) []byte {
 	putU16(b, 54, 0)
 	putU32(b, 56, uint32(keyOff))
 
-	const flags = 0x00000201 // unicode | ntlm
+	flags := uint32(0x00000201) // unicode | ntlm
+	if len(ntB) > 24 {
+		// NTLMv2 response: advertise extended session security + target info.
+		flags = 0x00088201
+	}
 	putU32(b, 60, flags)
 
 	copy(b[ntOff:], ntB)
@@ -175,6 +189,40 @@ func ntResponseEmptyPassword(server [8]byte) []byte {
 		out = append(out, enc[:]...)
 	}
 	return out
+}
+
+// ntlmv2Response builds an NTLMv2 response for an empty password. NTLMv2 is
+// required by modern Samba and Windows, which refuse NTLMv1 by default.
+func ntlmv2Response(ch *Challenge, user, domain string) []byte {
+	hash, _ := hex.DecodeString(emptyNTHash)
+	v2hash := hmacMD5(hash, utf16le(strings.ToUpper(user)+domain))
+
+	blob := make([]byte, 0, 28+len(ch.TargetInfoRaw))
+	blob = append(blob, 0x01, 0x01, 0x00, 0x00) // blob signature
+	blob = append(blob, 0, 0, 0, 0)             // reserved
+	blob = binary.LittleEndian.AppendUint64(blob, filetimeNow())
+	var client [8]byte
+	_, _ = rand.Read(client[:])
+	blob = append(blob, client[:]...)
+	blob = append(blob, 0, 0, 0, 0)
+	blob = append(blob, ch.TargetInfoRaw...)
+	if len(blob)%4 != 0 {
+		blob = append(blob, make([]byte, 4-len(blob)%4)...)
+	}
+
+	msg := append(append([]byte(nil), ch.Server[:]...), blob...)
+	proof := hmacMD5(v2hash, msg)
+	return append(proof, blob...)
+}
+
+func hmacMD5(key, data []byte) []byte {
+	h := hmac.New(md5.New, key)
+	h.Write(data)
+	return h.Sum(nil)
+}
+
+func filetimeNow() uint64 {
+	return uint64(time.Now().Unix()+11644473600) * 10_000_000
 }
 
 // desExpand turns a 7 byte key into the 8 byte DES key used by NTLM.

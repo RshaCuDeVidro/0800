@@ -22,6 +22,7 @@ type Store struct {
 	started  time.Time
 	finished bool
 	dirty    bool
+	recent   []RecentFinding
 
 	snap atomic.Pointer[Snapshot]
 
@@ -91,7 +92,8 @@ func (s *Store) flush() {
 func (s *Store) publishLocked() {
 	hosts := make([]*HostView, len(s.hosts))
 	copy(hosts, s.hosts)
-	s.snap.Store(&Snapshot{
+
+	snap := &Snapshot{
 		Hosts:    hosts,
 		Total:    s.total,
 		Done:     s.done,
@@ -100,7 +102,59 @@ func (s *Store) publishLocked() {
 		Started:  s.started,
 		Elapsed:  time.Since(s.started),
 		Finished: s.finished,
+		ByProto:  map[string]int{},
+	}
+	for _, h := range s.hosts {
+		if h.SMB != nil {
+			snap.ByProto["smb"]++
+		}
+		if h.LDAP != nil {
+			snap.ByProto["ldap"]++
+		}
+		if h.NFS != nil {
+			snap.ByProto["nfs"]++
+		}
+		for _, f := range h.Findings {
+			switch f.Severity {
+			case SevCritical:
+				snap.Crit++
+			case SevHigh:
+				snap.High++
+			case SevMedium:
+				snap.Med++
+			case SevLow:
+				snap.Low++
+			}
+		}
+		for _, d := range h.DBs {
+			snap.ByProto[d.Proto]++
+		}
+		if h.Discovered() > 0 {
+			snap.Exposed++
+		}
+	}
+	// Top exposures, kept short so the UI never sorts on every frame.
+	ranked := make([]*HostView, 0, len(s.hosts))
+	for _, h := range s.hosts {
+		if h.Discovered() > 0 {
+			ranked = append(ranked, h)
+		}
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].Sev != ranked[j].Sev {
+			return ranked[i].Sev > ranked[j].Sev
+		}
+		return ranked[i].Discovered() > ranked[j].Discovered()
 	})
+	if len(ranked) > 8 {
+		ranked = ranked[:8]
+	}
+	snap.Top = ranked
+	if n := len(s.recent); n > 0 {
+		snap.Recent = append([]RecentFinding(nil), s.recent...)
+		sort.SliceStable(snap.Recent, func(i, j int) bool { return snap.Recent[i].At.Before(snap.Recent[j].At) })
+	}
+	s.snap.Store(snap)
 }
 
 // mutate applies fn to a fresh copy of the host view and republishes it. The
@@ -304,11 +358,21 @@ func (s *Store) SetService(ip string, svc ServiceView) {
 // AddFinding appends a finding and bumps the global counter when it is real
 // exposure (medium or above).
 func (s *Store) AddFinding(ip string, f Finding) {
-	if f.Severity >= SevMedium {
-		s.mu.Lock()
-		s.findings++
-		s.mu.Unlock()
+	if f.At.IsZero() {
+		f.At = time.Now()
 	}
+	s.mu.Lock()
+	if f.Severity >= SevMedium {
+		s.findings++
+	}
+	s.recent = append(s.recent, RecentFinding{
+		At: f.At, IP: ip, Port: f.Port, Proto: f.Proto,
+		Label: f.Label, Detail: f.Detail, Sev: f.Severity,
+	})
+	if len(s.recent) > 64 {
+		s.recent = s.recent[len(s.recent)-64:]
+	}
+	s.mu.Unlock()
 	s.mutate(ip, func(v *HostView) {
 		v.Findings = append(v.Findings, f)
 	})

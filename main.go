@@ -15,14 +15,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/RshaCuDeVidro/0800/internal/report"
+	"github.com/RshaCuDeVidro/0800/internal/scan"
+	"github.com/RshaCuDeVidro/0800/internal/smb"
+	"github.com/RshaCuDeVidro/0800/internal/target"
+	"github.com/RshaCuDeVidro/0800/internal/ui"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
-	"github.com/rsha/0800/internal/report"
-	"github.com/rsha/0800/internal/scan"
-	"github.com/rsha/0800/internal/smb"
-	"github.com/rsha/0800/internal/target"
-	"github.com/rsha/0800/internal/ui"
 )
 
 var version = "0.1.0"
@@ -52,6 +52,7 @@ func run() error {
 		concurrency = flag.Int("c", 512, "parallel TCP workers")
 		probes      = flag.Int("probe-workers", 24, "parallel protocol workers")
 		rate        = flag.Int("rate", 0, "max dials per second (0 = unlimited)")
+		remap       = flag.String("remap", "", "probe a non-standard port, e.g. smb=1445,ldap=1389")
 		maxHosts    = flag.Int("max-hosts", 65536, "refuse to expand more than this many targets")
 		loot        = flag.String("loot", "0800-loot", "directory for downloaded files")
 		flat        = flag.Bool("flat", false, "download straight into the loot root")
@@ -85,6 +86,15 @@ func run() error {
 	portList, err := parsePorts(*portsFlag)
 	if err != nil {
 		return err
+	}
+	servicePorts, extraPorts, err := parseRemap(*remap)
+	if err != nil {
+		return err
+	}
+	for _, p := range extraPorts {
+		if !containsPort(portList, p) {
+			portList = append(portList, p)
+		}
 	}
 	if len(targets) == 0 {
 		flag.Usage()
@@ -125,6 +135,7 @@ func run() error {
 		Concurrency:  *concurrency,
 		ProbeWorkers: *probes,
 		Rate:         *rate,
+		ServicePorts: servicePorts,
 	}
 
 	if *plain {
@@ -194,6 +205,49 @@ func runDemo(w, h int) error {
 		return err
 	}
 	return nil
+}
+
+// parseRemap turns "smb=1445,ldap=1389" into a port->service map.
+func parseRemap(s string) (map[int]string, []int, error) {
+	out := map[int]string{}
+	var ports []int
+	if strings.TrimSpace(s) == "" {
+		return nil, nil, nil
+	}
+	valid := map[string]bool{
+		"smb": true, "ldap": true, "nfs": true, "kerberos": true,
+		"mysql": true, "postgres": true, "redis": true,
+	}
+	for _, pair := range strings.Split(s, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		svc, raw, ok := strings.Cut(pair, "=")
+		if !ok {
+			return nil, nil, fmt.Errorf("invalid --remap %q (want service=port)", pair)
+		}
+		svc = strings.ToLower(strings.TrimSpace(svc))
+		if !valid[svc] {
+			return nil, nil, fmt.Errorf("invalid --remap service %q", svc)
+		}
+		port, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || port < 1 || port > 65535 {
+			return nil, nil, fmt.Errorf("invalid --remap port %q", raw)
+		}
+		out[port] = svc
+		ports = append(ports, port)
+	}
+	return out, ports, nil
+}
+
+func containsPort(list []int, p int) bool {
+	for _, v := range list {
+		if v == p {
+			return true
+		}
+	}
+	return false
 }
 
 func parsePorts(s string) ([]int, error) {

@@ -59,13 +59,25 @@ func (s State) String() string {
 // Finding is a single, self-describing result. Evidence is mandatory: a finding
 // without a request/response trace is an opinion, not a result.
 type Finding struct {
-	Port     int      `json:"port"`
-	Proto    string   `json:"proto"`
-	Kind     string   `json:"kind"`
-	Label    string   `json:"label"`
-	Severity Severity `json:"severity"`
-	Detail   string   `json:"detail"`
-	Evidence []string `json:"evidence,omitempty"`
+	Port     int       `json:"port"`
+	Proto    string    `json:"proto"`
+	Kind     string    `json:"kind"`
+	Label    string    `json:"label"`
+	Severity Severity  `json:"severity"`
+	Detail   string    `json:"detail"`
+	Evidence []string  `json:"evidence,omitempty"`
+	At       time.Time `json:"at,omitempty"`
+}
+
+// RecentFinding is a feed entry for the live activity panel.
+type RecentFinding struct {
+	At     time.Time
+	IP     string
+	Port   int
+	Proto  string
+	Label  string
+	Detail string
+	Sev    Severity
 }
 
 // Tag is a compact badge rendered in the host list.
@@ -84,6 +96,7 @@ type ShareView struct {
 
 // SMBView is everything the SMB prober learned about a host.
 type SMBView struct {
+	Port    int         `json:"port,omitempty"`
 	Dialect string      `json:"dialect,omitempty"`
 	Signing string      `json:"signing,omitempty"`
 	SMB1    bool        `json:"smb1"`
@@ -247,10 +260,19 @@ type Snapshot struct {
 	Started  time.Time
 	Elapsed  time.Duration
 	Finished bool
+
+	Crit, High, Med, Low int
+	Exposed              int
+	Top                  []*HostView
+	ByProto              map[string]int
+	Recent               []RecentFinding
 }
 
 // Vulnerable returns the hosts that have at least one medium+ finding.
 func (s *Snapshot) Vulnerable() []*HostView {
+	if len(s.Top) == s.Exposed {
+		return append([]*HostView(nil), s.Top...)
+	}
 	out := make([]*HostView, 0, 8)
 	for _, h := range s.Hosts {
 		if h.Discovered() > 0 {

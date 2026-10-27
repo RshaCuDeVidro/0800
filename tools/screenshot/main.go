@@ -13,9 +13,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/RshaCuDeVidro/0800/internal/ui"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
-	"github.com/rsha/0800/internal/ui"
 )
 
 func main() {

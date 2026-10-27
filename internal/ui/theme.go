@@ -1,29 +1,29 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
+	"github.com/RshaCuDeVidro/0800/internal/scan"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/rsha/0800/internal/scan"
 )
 
-// Palette. Tuned for dark terminals; every colour has enough contrast on
-// #0B0E14 to stay readable in screenshots and over SSH.
+// Palette. Deep blue-black base, mint accent, coral for exposure.
 var (
-	colBg      = lipgloss.Color("#0B0E14")
-	colPanel   = lipgloss.Color("#0F141D")
-	colBorder  = lipgloss.Color("#242C3B")
-	colBorderF = lipgloss.Color("#3D4A63")
-	colText    = lipgloss.Color("#D7DEEA")
-	colDim     = lipgloss.Color("#6B7A90")
-	colFaint   = lipgloss.Color("#3A4557")
-	colAccent  = lipgloss.Color("#7EE7D0")
-	colBlue    = lipgloss.Color("#8AB4F8")
-	colWarn    = lipgloss.Color("#F5C76B")
-	colCrit    = lipgloss.Color("#FF6B81")
-	colHigh    = lipgloss.Color("#FF9E64")
-	colSel     = lipgloss.Color("#18202E")
+	colBg      = lipgloss.Color("#0A0D14")
+	colBorder  = lipgloss.Color("#1E2635")
+	colBorderF = lipgloss.Color("#3A4C66")
+	colText    = lipgloss.Color("#D5DDEA")
+	colDim     = lipgloss.Color("#6A7A92")
+	colFaint   = lipgloss.Color("#39445A")
+	colAccent  = lipgloss.Color("#6EE7C8")
+	colBlue    = lipgloss.Color("#7AA2F7")
+	colCrit    = lipgloss.Color("#FF5D7A")
+	colHigh    = lipgloss.Color("#FFA25C")
+	colMed     = lipgloss.Color("#F2C14E")
+	colLow     = lipgloss.Color("#7AA2F7")
+	colSel     = lipgloss.Color("#16202F")
 )
 
 func sevColor(s scan.Severity) lipgloss.Color {
@@ -33,9 +33,9 @@ func sevColor(s scan.Severity) lipgloss.Color {
 	case scan.SevHigh:
 		return colHigh
 	case scan.SevMedium:
-		return colWarn
+		return colMed
 	case scan.SevLow:
-		return colBlue
+		return colLow
 	default:
 		return colDim
 	}
@@ -49,16 +49,13 @@ var (
 	styleFaint    = lipgloss.NewStyle().Foreground(colFaint)
 	styleIP       = lipgloss.NewStyle().Foreground(colText)
 	styleIPPend   = lipgloss.NewStyle().Foreground(colFaint)
-	styleSel      = lipgloss.NewStyle().Background(colSel).Bold(true)
-	styleSelBar   = lipgloss.NewStyle().Foreground(colAccent).Background(colSel)
 	styleAccent   = lipgloss.NewStyle().Foreground(colAccent)
 	styleBlue     = lipgloss.NewStyle().Foreground(colBlue)
 	styleCrit     = lipgloss.NewStyle().Foreground(colCrit).Bold(true)
-	styleWarn     = lipgloss.NewStyle().Foreground(colWarn)
+	styleWarn     = lipgloss.NewStyle().Foreground(colMed)
 	styleErr      = lipgloss.NewStyle().Foreground(colCrit)
 	styleKey      = lipgloss.NewStyle().Foreground(colAccent).Bold(true)
 	styleKeyDesc  = lipgloss.NewStyle().Foreground(colDim)
-	styleChip     = lipgloss.NewStyle().Foreground(colBg).Background(colAccent).Padding(0, 1).Bold(true)
 )
 
 // truncate shortens s to w display cells, keeping ANSI styling intact.
@@ -117,18 +114,21 @@ func panel(title, right, body string, w, h int, focused bool) string {
 	if focused {
 		bc = colBorderF
 	}
-	innerW := w - 4 // border (2) + horizontal padding (2)
+	innerW := w - 4
 	innerH := h - 2
 
 	head := spread(styleSubtitle.Render(title), styleDim.Render(right), innerW)
 	lines := strings.Split(body, "\n")
-	if len(lines) > innerH-1 {
-		lines = lines[:innerH-1]
+	// Keep one empty row above the bottom border: dense panes otherwise look
+	// like they bleed into the frame.
+	capacity := max(1, innerH-2)
+	if len(lines) > capacity {
+		lines = lines[:capacity]
 	}
 	for i := range lines {
 		lines[i] = pad(truncate(lines[i], innerW), innerW)
 	}
-	for len(lines) < innerH-1 {
+	for len(lines) < capacity {
 		lines = append(lines, strings.Repeat(" ", innerW))
 	}
 	content := head + "\n" + strings.Join(lines, "\n")
@@ -142,11 +142,71 @@ func panel(title, right, body string, w, h int, focused bool) string {
 		Render(content)
 }
 
-// chip renders a small label.
-func chip(text string, c lipgloss.Color) string {
+// pill renders a filled severity badge.
+func pill(text string, s scan.Severity) string {
 	return lipgloss.NewStyle().
-		Foreground(c).
-		Background(lipgloss.Color("#151C28")).
+		Foreground(colBg).
+		Background(sevColor(s)).
+		Bold(true).
 		Padding(0, 1).
 		Render(text)
+}
+
+// dot renders a coloured bullet.
+func dot(s scan.Severity) string {
+	return lipgloss.NewStyle().Foreground(sevColor(s)).Render("●")
+}
+
+// section renders a short, fixed-width section header.
+func section(name string) string {
+	return styleDim.Render(name) + " " + styleFaint.Render(strings.Repeat("─", 10))
+}
+
+// sectionTitle renders "name ─────────" in a dim tone.
+func sectionTitle(name string, w int) string {
+	line := strings.Repeat("─", max(0, w-lipgloss.Width(name)-1))
+	return styleDim.Render(name) + " " + styleFaint.Render(line)
+}
+
+// meter renders a proportional mini bar.
+func meter(n, total, w int) string {
+	if total <= 0 || w <= 0 {
+		return styleFaint.Render(strings.Repeat("·", max(0, w)))
+	}
+	filled := int(float64(n) / float64(total) * float64(w))
+	if n > 0 && filled == 0 {
+		filled = 1
+	}
+	if filled > w {
+		filled = w
+	}
+	return styleAccent.Render(strings.Repeat("█", filled)) + styleFaint.Render(strings.Repeat("░", w-filled))
+}
+
+// twoColumns joins two blocks line by line.
+func twoColumns(left, right []string, lw, rw, gap int) string {
+	n := max(len(left), len(right))
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		l, r := "", ""
+		if i < len(left) {
+			l = left[i]
+		}
+		if i < len(right) {
+			r = right[i]
+		}
+		out = append(out, pad(truncate(l, lw), lw)+strings.Repeat(" ", gap)+pad(truncate(r, rw), rw))
+	}
+	return strings.Join(out, "\n")
+}
+
+func humanDuration(d float64) string {
+	if d < 1 {
+		return "—"
+	}
+	sec := int(d)
+	if sec < 60 {
+		return fmt.Sprintf("00:%02d", sec)
+	}
+	return fmt.Sprintf("%02d:%02d", sec/60, sec%60)
 }

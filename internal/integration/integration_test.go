@@ -18,10 +18,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rsha/0800/internal/db"
-	"github.com/rsha/0800/internal/ldap"
-	"github.com/rsha/0800/internal/nfs"
-	"github.com/rsha/0800/internal/smb"
+	"github.com/RshaCuDeVidro/0800/internal/db"
+	"github.com/RshaCuDeVidro/0800/internal/ldap"
+	"github.com/RshaCuDeVidro/0800/internal/nfs"
+	"github.com/RshaCuDeVidro/0800/internal/smb"
 )
 
 func ctx(t *testing.T) context.Context {

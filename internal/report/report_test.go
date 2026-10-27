@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rsha/0800/internal/scan"
+	"github.com/RshaCuDeVidro/0800/internal/scan"
 )
 
 func sampleSnapshot() *scan.Snapshot {

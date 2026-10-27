@@ -30,6 +30,7 @@ shots:
 	go run ./tools/screenshot -view browser -w 128 -h 40 -o docs/screenshots/browser.svg
 	go run ./tools/screenshot -view details -w 128 -h 40 -o docs/screenshots/details.svg
 	go run ./tools/screenshot -view help    -w 128 -h 40 -o docs/screenshots/help.svg
+	go run ./tools/screenshot -view summary -w 128 -h 40 -o docs/screenshots/summary.svg
 
 integration:
 	go test -tags integration ./internal/integration -v

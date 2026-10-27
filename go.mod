@@ -1,4 +1,4 @@
-module github.com/rsha/0800
+module github.com/RshaCuDeVidro/0800
 
 go 1.24.2
 
