@@ -96,3 +96,26 @@ func TestSummary(t *testing.T) {
 		t.Errorf("summary = %q", s)
 	}
 }
+
+func TestWriteMarkdown(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "report.md")
+	if err := WriteMarkdown(path, Build(sampleSnapshot(), "test")); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"# 0800 — null authentication report",
+		"## 192.0.2.10",
+		"null session",
+		"SESSION_SETUP null -> SUCCESS",
+		"written permission to test",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("markdown missing %q", want)
+		}
+	}
+}
