@@ -46,9 +46,17 @@ func (p *Probe) AuthKind() string {
 }
 
 // ProbeHost fingerprints an SMB endpoint without touching any file.
-func ProbeHost(ctx context.Context, ip string, cfg Config) (*Probe, error) {
+func ProbeHost(ctx context.Context, ip string, cfg Config) (p *Probe, err error) {
 	addr := cfg.address(ip)
-	p := &Probe{}
+	p = &Probe{}
+	// A malformed reply from a hostile server must not discard the auth result
+	// we already obtained; turn any panic into an enumeration note.
+	defer func() {
+		if r := recover(); r != nil {
+			p.EnumErr = fmt.Sprintf("enumeration panic: %v", r)
+			err = nil
+		}
+	}()
 
 	// SMB1 is probed on its own connection (servers that disabled it may reset
 	// the socket) and concurrently with the SMB2 handshake, so it costs latency

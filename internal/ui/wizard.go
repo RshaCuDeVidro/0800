@@ -311,7 +311,7 @@ func (m *wizardModel) View() string {
 	lines := []string{
 		"",
 		styleAccent.Bold(true).Render("0800") + styleSubtitle.Render("  null-auth recon"),
-		styleFaint.Render("interactive setup · v" + m.version),
+		styleFaint.Render("interactive setup · " + versionTag(m.version)),
 		"",
 		targetLine,
 		hint("ip, cidr, hostname, file or @file"),
@@ -405,7 +405,7 @@ func itoa(n int) string { return strconv.Itoa(n) }
 
 // NewWizardPreview builds a wizard for screenshots and docs.
 func NewWizardPreview(w, h int) tea.Model {
-	m := newWizard("0.3.0", Setup{TargetSpec: "10.10.0.0/24", Workers: 1024, WorkersSet: true})
+	m := newWizard("0.4.0", Setup{TargetSpec: "10.10.0.0/24", Workers: 1024, WorkersSet: true})
 	m.w, m.h = w, h
 	m.target.SetValue("10.10.0.0/24")
 	m.setFocus(0)

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"io"
 	"net"
 	"strings"
@@ -85,6 +86,10 @@ func (f *fakeSMB) handle(c net.Conn) {
 			f.reply(c, cmdNegotiate, StatusSuccess, h.MessageID, 0, 0, negotiateBody(f.signMode))
 
 		case cmdSessionSetup:
+			if u16(body, 14) == 0 {
+				// A real server would reject an empty security buffer.
+				return
+			}
 			stage++
 			if stage == 1 {
 				blob := spnegoInit(fakeType2())
@@ -489,28 +494,38 @@ func TestParseDirEntries(t *testing.T) {
 
 func TestNDRShareEnumRoundTrip(t *testing.T) {
 	req := ndrShareEnumRequest(`\\127.0.0.1`)
-	if len(req) < 28 {
+	if len(req) < 24 {
 		t.Fatalf("short request: %d", len(req))
 	}
 	if u32(req, 0) != 0x00020000 {
 		t.Errorf("ServerName referent = %#x", u32(req, 0))
 	}
-	if u32(req, 4) != 1 || u32(req, 8) != 1 {
-		t.Error("level must be 1")
+	max, off, actual := u32(req, 4), u32(req, 8), u32(req, 12)
+	if max != actual || off != 0 || actual != 12 {
+		t.Fatalf("string header max=%d off=%d actual=%d", max, off, actual)
 	}
-	if u32(req, 12) != 0x00020004 {
-		t.Errorf("container referent = %#x", u32(req, 12))
+	pos := align4(16 + int(actual)*2)
+	if got := u32(req, pos); got != 1 {
+		t.Errorf("Level = %d", got)
+	}
+	if got := u32(req, pos+4); got != 1 {
+		t.Errorf("union tag = %d", got)
+	}
+	if got := u32(req, pos+8); got != 0x00020004 {
+		t.Errorf("container referent = %#x", got)
+	}
+	if got := u32(req, pos+20); got != 0xFFFFFFFF {
+		t.Errorf("PreferedMaximumLength = %#x", got)
 	}
 
 	// Build a response stub with two shares and parse it back.
 	w := &ndrWriter{}
 	w.u32(1)          // Level
+	w.u32(1)          // union tag
 	w.u32(0x00020004) // container
-	w.u32(0x00020008) // total entries
-	w.u32(0x0002000C) // resume handle
 	w.u32(2)          // EntriesRead
 	w.u32(0x00020010) // buffer
-	w.u32(2)          // max count
+	w.u32(2)          // array max count
 	w.u32(0x00020014) // share[0].name
 	w.u32(0)          // type
 	w.u32(0x00020018) // share[0].remark
@@ -521,7 +536,9 @@ func TestNDRShareEnumRoundTrip(t *testing.T) {
 	w.str("shared folders")
 	w.str("print$")
 	w.u32(2) // total
-	w.u32(0) // resume
+	w.u32(0) // resume ref
+	w.u32(0) // resume value
+	w.u32(0) // win32 error
 
 	shares, err := ndrParseShareEnum(w.b)
 	if err != nil {
@@ -553,4 +570,89 @@ func FuzzParseType2(f *testing.F) {
 			_ = ch.Identity.DNSName
 		}
 	})
+}
+
+func TestSessionSetupOffsets(t *testing.T) {
+	tok := negoType1()
+	blob := spnegoInit(tok)
+	body := sessionSetupBody(blob)
+
+	if got := u16(body, 0); got != 25 {
+		t.Errorf("StructureSize = %d", got)
+	}
+	if got := u16(body, 12); got != smb2HeaderSize+24 {
+		t.Errorf("SecurityBufferOffset = %d, want %d", got, smb2HeaderSize+24)
+	}
+	if got := u16(body, 14); got != uint16(len(blob)) {
+		t.Errorf("SecurityBufferLength = %d, want %d", got, len(blob))
+	}
+	if off := int(u16(body, 12)) - smb2HeaderSize; string(body[off:off+1]) != "\x60" {
+		t.Errorf("security buffer does not start with a GSS-API token: %x", body[off:off+4])
+	}
+}
+
+func TestBindBodyLayout(t *testing.T) {
+	b := bindBody()
+	if len(b) != 56 {
+		t.Fatalf("bind body length = %d, want 56", len(b))
+	}
+	if b[8] != 1 { // one presentation context
+		t.Errorf("num contexts = %d", b[8])
+	}
+	if b[14] != 1 { // one transfer syntax
+		t.Errorf("num transfer syntaxes = %d", b[14])
+	}
+	if b[12] != 0 || b[13] != 0 { // context id must be zero
+		t.Errorf("context id = %d", int(b[12])|int(b[13])<<8)
+	}
+	if !bytesEqual(b[16:32], uuidSRVSVC[:]) {
+		t.Error("abstract syntax uuid mismatch")
+	}
+	if !bytesEqual(b[36:52], uuidNDR32[:]) {
+		t.Error("transfer syntax uuid mismatch")
+	}
+	if got := u32(b, 32); got != 3 {
+		t.Errorf("interface version = %d", got)
+	}
+	if got := u32(b, 52); got != 2 {
+		t.Errorf("ndr version = %d", got)
+	}
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Captured from a real NetrShareEnum response (two disk shares). This pins the
+// NDR layout that a real server emits, which is easy to get subtly wrong.
+func TestNDRParseRealResponse(t *testing.T) {
+	const hexStub = "010000000100000041690000020000009b79000002000000d6c500000000000030840000ed88" +
+		"000000000000fca2000005000000000000000500000049005000430024000000abab010000" +
+		"0000000000010000000000abab05000000000000000500000054004500530054000000abab" +
+		"0100000000000000010000000000bfbf020000000b4600000000000000000000"
+	stub, err := hex.DecodeString(hexStub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shares, err := ndrParseShareEnum(stub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shares) != 2 {
+		t.Fatalf("shares = %d: %+v", len(shares), shares)
+	}
+	if shares[0].Name != "IPC$" || shares[0].Type != "disk" {
+		t.Errorf("share[0] = %+v", shares[0])
+	}
+	if shares[1].Name != "TEST" {
+		t.Errorf("share[1] = %+v", shares[1])
+	}
 }

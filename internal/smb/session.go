@@ -85,14 +85,13 @@ func sessionSetupBody(blob []byte) []byte {
 	const fixed = 24
 	b := make([]byte, fixed+len(blob))
 	putU16(b, 0, 25)
-	b[2] = 0 // flags
-	b[3] = 1 // security mode: signing enabled
-	putU16(b, 4, 0)
-	putU32(b, 8, 0)  // capabilities
-	putU32(b, 12, 0) // channel
-	putU16(b, 16, uint16(smb2HeaderSize+fixed))
-	putU16(b, 18, uint16(len(blob)))
-	putU64(b, 20, 0) // previous session id
+	b[2] = 0                                    // flags
+	b[3] = 1                                    // security mode: signing enabled
+	putU32(b, 4, 0)                             // capabilities
+	putU32(b, 8, 0)                             // channel
+	putU16(b, 12, uint16(smb2HeaderSize+fixed)) // security buffer offset (64 + 24)
+	putU16(b, 14, uint16(len(blob)))            // security buffer length
+	putU64(b, 16, 0)                            // previous session id
 	copy(b[fixed:], blob)
 	return b
 }

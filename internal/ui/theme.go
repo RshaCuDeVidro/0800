@@ -142,6 +142,33 @@ func panel(title, right, body string, w, h int, focused bool) string {
 		Render(content)
 }
 
+// versionTag renders a version with a single leading "v".
+func versionTag(v string) string {
+	if v == "" {
+		return ""
+	}
+	if strings.HasPrefix(v, "v") {
+		return v
+	}
+	return "v" + v
+}
+
+// sevShort is the compact severity label used in badges.
+func sevShort(s scan.Severity) string {
+	switch s {
+	case scan.SevCritical:
+		return "CRIT"
+	case scan.SevHigh:
+		return "HIGH"
+	case scan.SevMedium:
+		return "MED"
+	case scan.SevLow:
+		return "LOW"
+	default:
+		return "INFO"
+	}
+}
+
 // pill renders a filled severity badge.
 func pill(text string, s scan.Severity) string {
 	return lipgloss.NewStyle().

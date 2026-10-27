@@ -15,11 +15,13 @@ func detailsLines(h *scan.HostView, width int) []string {
 	var lines []string
 	add := func(s string) { lines = append(lines, truncate(s, width)) }
 	add("")
+	nameLine := pill(sevShort(h.Sev), h.Sev) + " "
 	if h.Name != "" && h.Name != h.IP {
-		add(spread(styleText.Render(h.Name), styleDim.Render(h.State.String()), width))
+		nameLine += styleText.Render(h.Name)
 	} else {
-		add(styleDim.Render(h.State.String()))
+		nameLine += styleText.Render(h.IP)
 	}
+	add(spread(nameLine, styleDim.Render(h.State.String()), width))
 	if len(h.Ports) > 0 {
 		add(styleDim.Render("ports  ") + styleText.Render(joinPorts(h.Ports)))
 	}
