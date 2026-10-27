@@ -26,8 +26,11 @@ func renderDashboard(snap *scan.Snapshot, w, h int, focused bool) string {
 		statLine(snap.Crit, "critical", colCrit),
 		statLine(snap.High, "high", colHigh),
 		statLine(snap.Med+snap.Low, "medium / low", colMed),
-		"",
 	}
+	if snap.Findings == 0 && snap.Open > 0 {
+		stats = append(stats, "", styleWarn.Render("ports answering, no anonymous access yet"))
+	}
+	stats = append(stats, "")
 
 	var top []string
 	if len(snap.Top) > 0 {
