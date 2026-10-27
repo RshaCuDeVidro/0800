@@ -134,7 +134,7 @@ func (p *pipe) bind() error {
 	if err != nil {
 		return err
 	}
-	if len(resp) < 24 || resp[2] != rpcBindAck {
+	if len(resp) < 26 || resp[2] != rpcBindAck {
 		return fmt.Errorf("rpc: unexpected bind response")
 	}
 	secLen := int(binary.LittleEndian.Uint16(resp[24:]))

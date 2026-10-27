@@ -118,6 +118,10 @@ func PlainLine(h *scan.HostView) string {
 			b.WriteString(f.Detail)
 		}
 	}
+	if h.Err != "" {
+		b.WriteString(" | error: ")
+		b.WriteString(strings.SplitN(h.Err, "\n", 2)[0])
+	}
 	return b.String()
 }
 
