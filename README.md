@@ -33,9 +33,12 @@ are not tripped.
 
 ## Setup
 
-Running `0800` with no arguments opens an interactive setup screen: target, profile, ports,
-workers and whether to enumerate shares during the scan. Everything is also available as flags,
-so scripts never see the menu.
+Running `0800` on a terminal opens an interactive setup screen — with or without `-t`, and
+prefilled with whatever you passed on the command line. The last target and options are
+remembered in `~/.config/0800/config.json`.
+
+`--no-menu` skips it for scripts; `--plain` and pipes skip it too. Everything is also a flag, so
+automation never depends on the UI.
 
 ![setup](docs/screenshots/setup.svg)
 
@@ -99,6 +102,7 @@ flags:
       --rate           max dials/second (0 = unlimited)
       --enum-shares    probe common share names during the scan (short list)
       --menu           always show the interactive setup screen
+      --no-menu        skip the setup screen (scripts)
       --max-hosts      refuse to expand beyond this many targets (default 65536)
       --loot           download directory (default 0800-loot)
       --flat           download straight into the loot root
@@ -128,9 +132,9 @@ flags:
 | `?` | help |
 | `q` | quit |
 
-The right pane is a live dashboard until you open a target: counters, the top exposures and a
-stream of the newest findings. Opening an SMB/NFS host splits it into a file tree and that host's
-findings.
+The right pane is a live dashboard with a stream of the newest findings, plus a preview of the
+host under the cursor. Opening an SMB/NFS host splits it into a file tree and that host's
+findings; `s` turns the pane into a report-style summary.
 
 Downloads go to `0800-loot/<ip>/<share>/<path>/<file>` (use `--flat` for the current directory).
 Files are written to `.part` and renamed on completion, and existing names get a `(1)` suffix.
@@ -156,7 +160,7 @@ $ 0800 -t 192.0.2.0/24 -p 445,389 --plain
 ```json
 {
   "tool": "0800",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "started": "2026-10-27T12:00:00Z",
   "stats": { "targets": 4, "scanned": 4, "openPorts": 6, "findings": 4, "exposedHosts": 3 },
   "hosts": [
