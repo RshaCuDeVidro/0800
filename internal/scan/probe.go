@@ -9,42 +9,69 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rsha/0800/internal/db"
-	"github.com/rsha/0800/internal/ldap"
-	"github.com/rsha/0800/internal/nfs"
-	"github.com/rsha/0800/internal/smb"
+	"github.com/RshaCuDeVidro/0800/internal/db"
+	"github.com/RshaCuDeVidro/0800/internal/ldap"
+	"github.com/RshaCuDeVidro/0800/internal/nfs"
+	"github.com/RshaCuDeVidro/0800/internal/smb"
 )
 
 // dispatch routes an open port to the matching protocol prober.
 func (e *Engine) dispatch(ctx context.Context, ip string, port int) {
-	switch port {
-	case 445:
-		e.probeSMB(ctx, ip)
-	case 389:
-		e.probeLDAP(ctx, ip)
-	case 2049:
-		e.probeNFS(ctx, ip)
-	case 3306, 5432, 6379:
+	switch e.serviceFor(port) {
+	case "smb":
+		e.probeSMB(ctx, ip, port)
+	case "ldap":
+		e.probeLDAP(ctx, ip, port)
+	case "nfs":
+		e.probeNFS(ctx, ip, port)
+	case "mysql", "postgres", "redis":
 		e.probeDB(ctx, ip, port)
-	case 88:
+	case "kerberos":
 		e.probeKerberos(ctx, ip)
 	default:
 		e.banner(ctx, ip, port)
 	}
 }
 
-func (e *Engine) probeSMB(ctx context.Context, ip string) {
+func (e *Engine) serviceFor(port int) string {
+	if e.cfg.ServicePorts != nil {
+		if svc, ok := e.cfg.ServicePorts[port]; ok {
+			return svc
+		}
+	}
+	switch port {
+	case 445:
+		return "smb"
+	case 389, 636, 3268:
+		return "ldap"
+	case 2049:
+		return "nfs"
+	case 3306:
+		return "mysql"
+	case 5432:
+		return "postgres"
+	case 6379:
+		return "redis"
+	case 88:
+		return "kerberos"
+	}
+	return ""
+}
+
+func (e *Engine) probeSMB(ctx context.Context, ip string, port int) {
 	cfg := smb.DefaultConfig()
+	cfg.Port = port
 	cfg.DialTimeout = e.cfg.DialTimeout
 	cfg.IOTimeout = e.cfg.IOTimeout
 
 	p, err := smb.ProbeHost(ctx, ip, cfg)
 	if err != nil {
-		e.store.SetService(ip, ServiceView{Port: 445, Proto: "smb", Banner: err.Error()})
+		e.store.SetService(ip, ServiceView{Port: port, Proto: "smb", Banner: err.Error()})
 		return
 	}
 
 	view := &SMBView{
+		Port:    port,
 		Dialect: p.Dialect,
 		Signing: p.Signing,
 		SMB1:    p.SMB1,
@@ -92,13 +119,13 @@ func (e *Engine) probeSMB(ctx context.Context, ip string) {
 	switch view.Auth {
 	case "null":
 		e.store.AddFinding(ip, Finding{
-			Port: 445, Proto: "smb", Kind: "smb-null", Label: "null session",
+			Port: port, Proto: "smb", Kind: "smb-null", Label: "null session",
 			Severity: SevCritical, Detail: "anonymous SMB session accepted · " + base,
 			Evidence: evidence,
 		})
 	case "guest":
 		e.store.AddFinding(ip, Finding{
-			Port: 445, Proto: "smb", Kind: "smb-guest", Label: "guest login",
+			Port: port, Proto: "smb", Kind: "smb-guest", Label: "guest login",
 			Severity: SevHigh, Detail: "guest account accepted with empty password · " + base,
 			Evidence: evidence,
 		})
@@ -106,13 +133,13 @@ func (e *Engine) probeSMB(ctx context.Context, ip string) {
 
 	if p.Signing == "disabled" {
 		e.store.AddFinding(ip, Finding{
-			Port: 445, Proto: "smb", Kind: "smb-signing", Label: "signing off",
+			Port: port, Proto: "smb", Kind: "smb-signing", Label: "signing off",
 			Severity: SevLow, Detail: "SMB signing disabled (relay surface)",
 		})
 	}
 	if p.SMB1 {
 		e.store.AddFinding(ip, Finding{
-			Port: 445, Proto: "smb", Kind: "smb1", Label: "smb1",
+			Port: port, Proto: "smb", Kind: "smb1", Label: "smb1",
 			Severity: SevLow, Detail: "SMB1 dialect accepted (" + p.SMB1Signing + " signing)",
 		})
 	}
@@ -129,21 +156,21 @@ func (e *Engine) probeSMB(ctx context.Context, ip string) {
 		}
 		sort.Strings(names)
 		e.store.AddFinding(ip, Finding{
-			Port: 445, Proto: "smb", Kind: "smb-shares", Label: "shares",
+			Port: port, Proto: "smb", Kind: "smb-shares", Label: "shares",
 			Severity: sev,
 			Detail:   fmt.Sprintf("%d share(s): %s", len(names), strings.Join(names, ", ")),
 			Evidence: append(evidence, fmt.Sprintf("NetrShareEnum -> %d shares", len(names))),
 		})
 		if len(writable) > 0 {
 			e.store.AddFinding(ip, Finding{
-				Port: 445, Proto: "smb", Kind: "smb-write", Label: "write access",
+				Port: port, Proto: "smb", Kind: "smb-write", Label: "write access",
 				Severity: SevCritical,
 				Detail:   "writable share(s) as unauthenticated user: " + strings.Join(writable, ", "),
 			})
 		}
 	} else if p.EnumErr != "" {
 		e.store.AddFinding(ip, Finding{
-			Port: 445, Proto: "smb", Kind: "smb-enum", Label: "enum denied",
+			Port: port, Proto: "smb", Kind: "smb-enum", Label: "enum denied",
 			Severity: SevInfo, Detail: "share enumeration failed: " + p.EnumErr,
 			Evidence: evidence,
 		})
@@ -164,11 +191,11 @@ func (e *Engine) probeSMB(ctx context.Context, ip string) {
 	}
 }
 
-func (e *Engine) probeLDAP(ctx context.Context, ip string) {
-	addr := net.JoinHostPort(ip, "389")
+func (e *Engine) probeLDAP(ctx context.Context, ip string, port int) {
+	addr := net.JoinHostPort(ip, strconv.Itoa(port))
 	res, err := ldap.Probe(ctx, addr, e.cfg.IOTimeout)
 	if err != nil {
-		e.store.SetService(ip, ServiceView{Port: 389, Proto: "ldap", Banner: err.Error()})
+		e.store.SetService(ip, ServiceView{Port: port, Proto: "ldap", Banner: err.Error()})
 		return
 	}
 	view := &LDAPView{
@@ -195,11 +222,11 @@ func (e *Engine) probeLDAP(ctx context.Context, ip string) {
 	if res.Vendor != "" {
 		kv = append(kv, [2]string{"vendor", strings.TrimSpace(res.Vendor + " " + res.Version)})
 	}
-	e.store.SetService(ip, ServiceView{Port: 389, Proto: "ldap", Banner: res.DefaultDN, KV: kv})
+	e.store.SetService(ip, ServiceView{Port: port, Proto: "ldap", Banner: res.DefaultDN, KV: kv})
 
 	if res.Entries > 0 {
 		e.store.AddFinding(ip, Finding{
-			Port: 389, Proto: "ldap", Kind: "ldap-anon", Label: "anon search",
+			Port: port, Proto: "ldap", Kind: "ldap-anon", Label: "anon search",
 			Severity: SevHigh,
 			Detail: fmt.Sprintf("anonymous bind returned %d object(s) from %s",
 				res.Entries, res.DefaultDN),
@@ -210,16 +237,16 @@ func (e *Engine) probeLDAP(ctx context.Context, ip string) {
 		})
 	} else if res.Bound {
 		e.store.AddFinding(ip, Finding{
-			Port: 389, Proto: "ldap", Kind: "ldap-bind", Label: "anon bind",
+			Port: port, Proto: "ldap", Kind: "ldap-bind", Label: "anon bind",
 			Severity: SevLow, Detail: "anonymous bind accepted, no objects readable",
 		})
 	}
 }
 
-func (e *Engine) probeNFS(ctx context.Context, ip string) {
-	res, err := nfs.Probe(ctx, ip, nfs.Config{Timeout: e.cfg.IOTimeout})
+func (e *Engine) probeNFS(ctx context.Context, ip string, port int) {
+	res, err := nfs.Probe(ctx, ip, nfs.Config{Timeout: e.cfg.IOTimeout, Port: uint16(port)})
 	if err != nil {
-		e.store.SetService(ip, ServiceView{Port: 2049, Proto: "nfs", Banner: err.Error()})
+		e.store.SetService(ip, ServiceView{Port: port, Proto: "nfs", Banner: err.Error()})
 		return
 	}
 	view := &NFSView{Version: res.Version, Note: res.Note, Port: res.Port, MountPort: res.MountPort}
@@ -243,7 +270,7 @@ func (e *Engine) probeNFS(ctx context.Context, ip string) {
 		sev = SevHigh
 	}
 	e.store.AddFinding(ip, Finding{
-		Port: 2049, Proto: "nfs", Kind: "nfs-export", Label: "exports",
+		Port: port, Proto: "nfs", Kind: "nfs-export", Label: "exports",
 		Severity: sev,
 		Detail:   strings.Join(listed, ", "),
 		Evidence: []string{
@@ -253,7 +280,7 @@ func (e *Engine) probeNFS(ctx context.Context, ip string) {
 	})
 	if len(mounted) > 0 {
 		e.store.AddFinding(ip, Finding{
-			Port: 2049, Proto: "nfs", Kind: "nfs-read", Label: "nfs read",
+			Port: port, Proto: "nfs", Kind: "nfs-read", Label: "nfs read",
 			Severity: SevHigh, Detail: "readable without credentials: " + strings.Join(mounted, ", "),
 		})
 	}

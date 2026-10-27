@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RshaCuDeVidro/0800/internal/nfs"
+	"github.com/RshaCuDeVidro/0800/internal/scan"
+	"github.com/RshaCuDeVidro/0800/internal/smb"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/rsha/0800/internal/nfs"
-	"github.com/rsha/0800/internal/scan"
-	"github.com/rsha/0800/internal/smb"
 )
 
 type browserMode int
@@ -72,6 +72,8 @@ type browser struct {
 	fs remoteFS
 
 	mountPort uint16
+	nfsPort   uint16
+	smbPort   int
 	export    string
 	info      []string
 	scroll    int
@@ -114,6 +116,7 @@ func (b *browser) openHost(h *scan.HostView) tea.Cmd {
 		b.mode = modeShares
 		b.proto = "smb"
 		b.auth = h.SMB.Auth
+		b.smbPort = h.SMB.Port
 		b.shares = nil
 		for _, s := range h.SMB.Shares {
 			b.shares = append(b.shares, shareItem{
@@ -127,6 +130,7 @@ func (b *browser) openHost(h *scan.HostView) tea.Cmd {
 		b.mode = modeShares
 		b.proto = "nfs"
 		b.mountPort = h.NFS.MountPort
+		b.nfsPort = h.NFS.Port
 		for _, e := range h.NFS.Exports {
 			comment := "export"
 			if len(e.Groups) > 0 {
@@ -172,7 +176,8 @@ func (b *browser) rows() int {
 func (b *browser) connectCmd(item shareItem) tea.Cmd {
 	proto, ip, auth := b.proto, b.hostIP, b.auth
 	cfg, timeout, mountPort := b.smbCfg, b.nfsTimeout, b.mountPort
-	nfsCfg := nfs.Config{Timeout: timeout, MountPort: mountPort}
+	cfg.Port = b.smbPort
+	nfsCfg := nfs.Config{Timeout: timeout, MountPort: mountPort, Port: b.nfsPort}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
@@ -371,7 +376,7 @@ func (b *browser) render(w, h int, focused bool) string {
 	}
 	right = truncate(right, max(0, w/3))
 
-	inner := h - 3
+	inner := h - 4
 	if inner < 1 {
 		inner = 1
 	}
@@ -498,10 +503,9 @@ func (b *browser) renderEmpty(width, height int) string {
 		strings.Repeat(" ", pad)+styleAccent.Bold(true).Render("0800"),
 		strings.Repeat(" ", pad)+styleDim.Render("null-auth recon"),
 		"",
-		strings.Repeat(" ", pad)+styleText.Render("select a host and press enter"),
+		strings.Repeat(" ", pad)+styleText.Render("select a target and press enter"),
 		strings.Repeat(" ", pad)+styleFaint.Render("SMB and NFS hosts open a remote file tree"),
-		"",
-		strings.Repeat(" ", pad)+styleFaint.Render("j/k move   ↵ open   h back   g get"),
+		strings.Repeat(" ", pad)+styleFaint.Render("press s for the exposure summary"),
 	)
 	for len(lines) < height {
 		lines = append(lines, "")

@@ -16,8 +16,9 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/rsha/0800/internal/scan"
-	"github.com/rsha/0800/internal/smb"
+
+	"github.com/RshaCuDeVidro/0800/internal/scan"
+	"github.com/RshaCuDeVidro/0800/internal/smb"
 )
 
 // Config wires the model to the running scan.
@@ -45,9 +46,11 @@ type Model struct {
 	allHosts bool
 	filter   string
 
-	focus       int // 0 = hosts, 1 = remote
+	focus       int // 0 = hosts, 1 = right pane
 	showDetails bool
 	detailsOff  int
+	showSummary bool
+	summaryOff  int
 	browser     browser
 
 	filtering bool
@@ -56,6 +59,10 @@ type Model struct {
 	spinner  spinner.Model
 	scanning bool
 	started  time.Time
+
+	rate       float64
+	lastDone   int
+	lastRateAt time.Time
 
 	showHelp bool
 
@@ -105,7 +112,6 @@ func New(cfg Config) *Model {
 	m.browser = browser{smbCfg: cfg.SMB, nfsTimeout: cfg.NFSTimeout}
 	if cfg.Store != nil {
 		m.snap = cfg.Store.Snapshot()
-		m.started = m.snap.Started
 		m.refresh()
 	}
 	return m
@@ -113,7 +119,7 @@ func New(cfg Config) *Model {
 
 // Init implements tea.Model.
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(tea.SetWindowTitle("0800 · null auth recon"), m.spinner.Tick, tick())
+	return tea.Batch(tea.SetWindowTitle("0800 · null-auth recon"), m.spinner.Tick, tick())
 }
 
 func tick() tea.Cmd {
@@ -147,6 +153,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.toast("mounted "+msg.share, scan.SevLow)
 			m.focus = 1
 			m.showDetails = false
+			m.showSummary = false
 		}
 		return m, nil
 
@@ -209,8 +216,16 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		m.showHelp = true
 		return m, nil
+	case "s":
+		m.showSummary = !m.showSummary
+		if m.showSummary {
+			m.summaryOff = 0
+			m.showDetails = false
+		}
+		return m, nil
 	case "tab":
 		m.showDetails = !m.showDetails
+		m.showSummary = false
 		if m.showDetails {
 			m.focus = 1
 			m.detailsOff = 0
@@ -227,10 +242,25 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, textinput.Blink
 	}
 
+	if m.showSummary {
+		switch key {
+		case "j", "down":
+			m.summaryOff++
+		case "k", "up":
+			m.summaryOff--
+		case "ctrl+d":
+			m.summaryOff += 10
+		case "ctrl+u":
+			m.summaryOff -= 10
+		case "esc":
+			m.showSummary = false
+		}
+		return m, nil
+	}
+
 	if m.w < 78 {
 		m.focus = 0
 	}
-
 	if m.focus == 1 {
 		return m, m.keyRemote(msg)
 	}
@@ -251,8 +281,6 @@ func (m *Model) keyHosts(msg tea.KeyMsg) tea.Cmd {
 		m.moveCursor(-len(m.hosts))
 	case matches(msg, keys.Bottom):
 		m.moveCursor(len(m.hosts))
-	case matches(msg, keys.Details):
-		m.showDetails = !m.showDetails
 	case msg.String() == "right" || msg.String() == "l":
 		return m.openHost()
 	case matches(msg, keys.Open):
@@ -321,6 +349,7 @@ func (m *Model) openHost() tea.Cmd {
 	if h == nil {
 		return nil
 	}
+	m.showSummary = false
 	cmd := m.browser.openHost(h)
 	m.showDetails = m.browser.mode == modeEmpty
 	m.focus = 1
@@ -336,6 +365,26 @@ func (m *Model) refresh() {
 	snap := m.cfg.Store.Snapshot()
 	m.snap = snap
 	m.scanning = !snap.Finished
+
+	now := time.Now()
+	if !snap.Finished {
+		if m.lastRateAt.IsZero() {
+			m.lastRateAt, m.lastDone = now, snap.Done
+		} else if dt := now.Sub(m.lastRateAt).Seconds(); dt >= 0.5 {
+			inst := float64(snap.Done-m.lastDone) / dt
+			if inst < 0 {
+				inst = 0
+			}
+			if m.rate == 0 {
+				m.rate = inst
+			} else {
+				m.rate = m.rate*0.6 + inst*0.4
+			}
+			m.lastRateAt, m.lastDone = now, snap.Done
+		}
+	} else {
+		m.rate = 0
+	}
 
 	prevIP := ""
 	if h := m.selected(); h != nil {
@@ -425,14 +474,23 @@ func (m *Model) hostRows() int {
 	if m.h < 16 {
 		return 1
 	}
-	return max(1, m.h-4-3)
+	return max(1, m.h-8)
 }
 
 func (m *Model) remoteRows() int {
 	if m.h < 16 {
 		return 1
 	}
-	return max(1, m.h-4-3)
+	mainH := m.h - 4
+	if mainH >= 26 {
+		findH := 4
+		if sel := m.selected(); sel != nil {
+			findH = max(findH, len(sel.Findings)+3)
+		}
+		findH = min(findH, mainH*45/100)
+		return max(1, mainH-findH-4)
+	}
+	return max(1, mainH-4)
 }
 
 // View implements tea.Model.
@@ -452,6 +510,8 @@ func (m *Model) View() string {
 	switch {
 	case m.showHelp:
 		body = m.helpView(bodyH)
+	case m.showSummary:
+		body = renderSummary(m.snap, m.w, bodyH, m.summaryOff, true)
 	default:
 		body = m.main(bodyH)
 	}
@@ -463,8 +523,8 @@ func (m *Model) main(h int) string {
 		return m.hostPanel(m.w, h, true)
 	}
 	leftW := m.w * 38 / 100
-	if leftW < 32 {
-		leftW = 32
+	if leftW < 34 {
+		leftW = 34
 	}
 	if leftW > 56 {
 		leftW = 56
@@ -474,35 +534,50 @@ func (m *Model) main(h int) string {
 	left := m.hostPanel(leftW, h, m.focus == 0)
 
 	var right string
-	if m.showDetails {
+	switch {
+	case m.showDetails:
 		if sel := m.selected(); sel != nil {
 			right = renderDetails(sel, rightW, h, m.detailsOff, m.focus == 1)
 		} else {
 			right = panel("details", "", styleDim.Render("no selection"), rightW, h, false)
 		}
-	} else if m.browser.mode == modeEmpty {
-		right = m.browser.render(rightW, h, false)
-	} else {
-		right = m.browser.render(rightW, h, m.focus == 1)
+	case m.browser.mode != modeEmpty:
+		sel := m.selected()
+		if h >= 26 {
+			// Grow the findings pane with its content, but never past 45%.
+			findH := 4
+			if sel != nil {
+				findH = max(findH, len(sel.Findings)+3)
+			}
+			findH = min(findH, h*45/100)
+			treeH := h - findH
+			tree := m.browser.render(rightW, treeH, m.focus == 1)
+			find := renderFindings(sel, rightW, findH, false)
+			right = lipgloss.JoinVertical(lipgloss.Left, tree, find)
+		} else {
+			right = m.browser.render(rightW, h, m.focus == 1)
+		}
+	default:
+		right = renderDashboard(m.snap, rightW, h, false)
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
 }
 
 func (m *Model) hostPanel(w, h int, focused bool) string {
 	innerW := w - 4
-	inner := h - 3
+	inner := h - 4
 	if inner < 1 {
 		inner = 1
 	}
 	if len(m.hosts) == 0 {
-		msg := "waiting for hosts…"
+		msg := styleDim.Render("waiting for hosts…")
 		if !m.scanning {
-			msg = "no hosts matched"
+			msg = styleDim.Render("no hosts matched")
 		}
 		if m.filter != "" {
-			msg = "no match for " + m.filter
+			msg = styleDim.Render("no match for " + m.filter)
 		}
-		return panel(m.listTitle(), "", styleDim.Render(msg), w, h, focused)
+		return panel(m.listTitle(), "", msg, w, h, focused)
 	}
 
 	if m.cursor >= len(m.hosts) {
@@ -530,6 +605,9 @@ func (m *Model) listTitle() string {
 }
 
 func (m *Model) listRight() string {
+	if m.snap == nil {
+		return ""
+	}
 	if m.scanning {
 		return fmt.Sprintf("%d/%d", m.snap.Done, m.snap.Total)
 	}
@@ -541,14 +619,10 @@ func (m *Model) hostRow(h *scan.HostView, selected bool, width int) string {
 	if selected {
 		marker = styleAccent.Render("▌ ")
 	}
+	sev := dot(h.Sev)
 	ip := h.IP
-	if h.Name != "" && h.Name != h.IP && width > 52 {
-		ip = h.IP + " " + h.Name
-	}
 
-	// Fit as many tags as possible, highest severity first, and summarise the
-	// remainder instead of cutting a word in half.
-	avail := width - 2 - lipgloss.Width(ip) - 1
+	avail := width - 2 - 2 - lipgloss.Width(ip) - 1
 	shown := make([]scan.Tag, 0, len(h.Tags))
 	used := 0
 	for _, t := range h.Tags {
@@ -563,25 +637,27 @@ func (m *Model) hostRow(h *scan.HostView, selected bool, width int) string {
 	tagText := ""
 	if leftover > 0 && avail > 3 {
 		tagText = "+" + fmt.Sprint(leftover)
-		if used+len(tagText) <= avail {
-			used += len(tagText)
-		}
 	}
 
 	plain := ip
-	if len(shown) > 0 || tagText != "" {
-		parts := make([]string, 0, len(shown)+1)
-		for _, t := range shown {
-			parts = append(parts, t.Text)
-		}
-		if tagText != "" {
-			parts = append(parts, tagText)
-		}
-		plain = spread(ip, strings.Join(parts, " "), width-2)
+	parts := make([]string, 0, len(shown)+1)
+	for _, t := range shown {
+		parts = append(parts, t.Text)
+	}
+	if tagText != "" {
+		parts = append(parts, tagText)
+	}
+	if len(parts) > 0 {
+		plain = spread(ip, strings.Join(parts, " "), width-4)
 	}
 
 	if selected {
-		return pad(marker+lipgloss.NewStyle().Bold(true).Background(colSel).Foreground(colText).Render(pad(plain, width-2)), width)
+		line := lipgloss.NewStyle().
+			Bold(true).
+			Background(colSel).
+			Foreground(colText).
+			Render(pad("● "+plain, width-2))
+		return pad(marker+line, width)
 	}
 
 	ipStyle := styleIP
@@ -589,7 +665,7 @@ func (m *Model) hostRow(h *scan.HostView, selected bool, width int) string {
 		ipStyle = styleIPPend
 	}
 	if len(shown) == 0 {
-		return pad(marker+ipStyle.Render(truncate(plain, width-2)), width)
+		return pad(marker+sev+" "+ipStyle.Render(truncate(plain, width-4)), width)
 	}
 
 	styleTags := make([]string, 0, len(shown)+1)
@@ -599,37 +675,76 @@ func (m *Model) hostRow(h *scan.HostView, selected bool, width int) string {
 	if tagText != "" {
 		styleTags = append(styleTags, styleFaint.Render(tagText))
 	}
-	ipW := max(0, width-2-used-1)
+	ipW := max(0, width-4-used-1)
 	left := ipStyle.Render(pad(truncate(ip, ipW), ipW))
-	line := spread(left, strings.Join(styleTags, " "), width-2)
-	return pad(marker+line, width)
+	line := spread(left, strings.Join(styleTags, " "), width-4)
+	return pad(marker+sev+" "+line, width)
 }
 
 func (m *Model) header() string {
-	left := styleTitle.Render("0800") + styleSubtitle.Render("  null-auth recon")
-	if m.snap != nil && m.snap.Total > 0 {
-		left = spread(left, styleFaint.Render(fmt.Sprintf("v%s", m.cfg.Version)), m.w)
-	}
+	brand := styleAccent.Bold(true).Render("▌ 0800") + styleSubtitle.Render("  null-auth recon")
+	line1 := spread(brand, styleFaint.Render("v"+m.cfg.Version), m.w)
 
 	pct := 0.0
+	eta := "—"
 	if m.snap != nil && m.snap.Total > 0 {
 		pct = float64(m.snap.Done) / float64(m.snap.Total)
+		if m.rate > 0.1 && m.snap.Done < m.snap.Total {
+			eta = humanDuration(float64(m.snap.Total-m.snap.Done) / m.rate)
+		}
 	}
-	barW := min(28, max(10, m.w/5))
-	status := "done"
+	spinner := ""
+	state := "done"
 	if m.scanning {
-		status = m.spinner.View() + " scanning"
+		spinner = m.spinner.View() + " "
+		state = "scanning"
 	}
-	line2 := ""
+	rate := ""
+	if m.rate > 0.1 {
+		rate = fmt.Sprintf("%.1f/s", m.rate)
+	}
+	barW := min(26, max(10, m.w/6))
+	var left string
+	if m.scanning {
+		parts := []string{fmt.Sprintf("%s  %3.0f%%", bar(pct, barW), pct*100), spinner}
+		if rate != "" {
+			parts = append(parts, rate)
+		}
+		if eta != "—" {
+			parts = append(parts, "eta "+eta)
+		}
+		left = strings.Join(parts, "  ")
+	} else {
+		left = fmt.Sprintf("%s  100%%  %s", bar(1, barW), state)
+	}
+
+	right := ""
 	if m.snap != nil {
-		line2 = fmt.Sprintf("%s  %3.0f%%  %s  ·  %d open  ·  %d findings",
-			bar(pct, barW), pct*100, status, m.snap.Open, m.snap.Findings)
+		chips := []string{
+			fmt.Sprintf("%d ports", m.snap.Open),
+			fmt.Sprintf("%d exposed", m.snap.Exposed),
+		}
+		sev := []string{}
+		if m.snap.Crit > 0 {
+			sev = append(sev, lipgloss.NewStyle().Foreground(colCrit).Bold(true).Render(fmt.Sprintf("%dC", m.snap.Crit)))
+		}
+		if m.snap.High > 0 {
+			sev = append(sev, lipgloss.NewStyle().Foreground(colHigh).Bold(true).Render(fmt.Sprintf("%dH", m.snap.High)))
+		}
+		if m.snap.Med > 0 {
+			sev = append(sev, lipgloss.NewStyle().Foreground(colMed).Bold(true).Render(fmt.Sprintf("%dM", m.snap.Med)))
+		}
+		right = styleDim.Render(strings.Join(chips, " · "))
+		if len(sev) > 0 {
+			right += styleFaint.Render(" · ") + strings.Join(sev, " ")
+		}
 	}
-	line2Style := styleDim
-	if m.scanning {
-		line2Style = styleText
+	line2 := spread(left, right, m.w)
+	style2 := styleText
+	if !m.scanning {
+		style2 = styleDim
 	}
-	return pad(left, m.w) + "\n" + pad(line2Style.Render(truncate(line2, m.w)), m.w)
+	return pad(line1, m.w) + "\n" + pad(style2.Render(truncate(line2, m.w)), m.w)
 }
 
 func (m *Model) footer() string {
@@ -642,7 +757,7 @@ func (m *Model) footer() string {
 	type hint struct{ k, d string }
 	hints := []hint{
 		{"j/k", "move"}, {"↵", "open"}, {"h", "back"}, {"g", "get"},
-		{"tab", "details"}, {"/", "filter"}, {"?", "help"}, {"q", "quit"},
+		{"tab", "details"}, {"/", "filter"}, {"s", "summary"}, {"?", "help"}, {"q", "quit"},
 	}
 	var b strings.Builder
 	used := 0
@@ -683,6 +798,9 @@ func (m *Model) statusLine() string {
 			styleText.Render(m.dl.name) + " " +
 			styleDim.Render(fmt.Sprintf("%s / %s  %3.0f%%", humanSize(done), humanSize(total), pct*100))
 	}
+	if m.showSummary {
+		return styleDim.Render(" summary · j/k scroll · s or esc to close")
+	}
 	h := m.selected()
 	if h == nil {
 		if m.snap != nil {
@@ -691,11 +809,22 @@ func (m *Model) statusLine() string {
 		}
 		return ""
 	}
-	left := styleAccent.Render(" "+h.IP) + " " + styleDim.Render(h.Detail)
-	if m.browser.mode == modeDir && m.focus == 1 {
-		left = styleAccent.Render(" " + m.browser.absolute())
+	if m.focus == 1 && m.browser.mode == modeDir {
+		left := styleAccent.Render(" " + m.browser.absolute())
+		return left
 	}
-	return left
+	left := dot(h.Sev) + " " + styleText.Render(h.IP)
+	if h.Name != "" && h.Name != h.IP {
+		left += styleDim.Render("  " + h.Name)
+	}
+	if h.Detail != "" {
+		left += styleDim.Render("  ·  " + h.Detail)
+	}
+	right := ""
+	if len(h.Ports) > 0 {
+		right = styleFaint.Render(joinPorts(h.Ports) + " ")
+	}
+	return spread(left, right, m.w)
 }
 
 func (m *Model) toast(text string, sev scan.Severity) {
@@ -717,7 +846,8 @@ func (m *Model) helpView(h int) string {
 		{"h or esc", "go back one level"},
 		{"g", "download the selected file"},
 		{"tab", "toggle the details pane"},
-		{"/ ", "filter hosts by ip, name or tag"},
+		{"s", "summary: severity, top exposures, services"},
+		{"/", "filter hosts by ip, name or tag"},
 		{"a", "show every target, including silent ones"},
 		{"r", "reload the current directory"},
 		{"?", "this help"},
@@ -771,6 +901,7 @@ func (m *Model) download() tea.Cmd {
 	}
 	remote := joinRemote(m.browser.path, e.Name)
 	dest := m.destPath(e.Name)
+
 	st := &downloadState{name: e.Name}
 	if e.Size > 0 {
 		st.total.Store(e.Size)
@@ -893,5 +1024,8 @@ func bar(p float64, w int) string {
 		p = 1
 	}
 	n := int(p * float64(w))
+	if n == 0 && p > 0 {
+		n = 1
+	}
 	return styleAccent.Render(strings.Repeat("█", n)) + styleFaint.Render(strings.Repeat("░", w-n))
 }

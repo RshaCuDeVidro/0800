@@ -19,6 +19,9 @@ type Config struct {
 	Concurrency  int
 	ProbeWorkers int
 	Rate         int // dials per second, 0 = unlimited
+	// ServicePorts maps a non-standard port to a protocol name ("smb", "ldap",
+	// "nfs", "mysql", "postgres", "redis", "kerberos"). Useful for labs and NAT.
+	ServicePorts map[int]string
 	OnFinish     func(*HostView)
 	// Probe overrides the protocol dispatcher (tests).
 	Probe func(ctx context.Context, e *Engine, ip string, port int)

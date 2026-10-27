@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RshaCuDeVidro/0800/internal/scan"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/rsha/0800/internal/scan"
 )
 
 // detailsLines renders the forensic view of a host. It is deliberately
@@ -155,7 +155,7 @@ func detailsLines(h *scan.HostView, width int) []string {
 
 func renderDetails(h *scan.HostView, w, h2, scroll int, focused bool) string {
 	lines := detailsLines(h, w-4)
-	inner := h2 - 3
+	inner := h2 - 4
 	if inner < 1 {
 		inner = 1
 	}

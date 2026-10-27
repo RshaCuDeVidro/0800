@@ -6,8 +6,8 @@
 endpoints that expose data to unauthenticated users. It ships as a single static binary with a
 keyboard-driven terminal UI, a headless mode for pipelines, and JSON output for reporting.
 
-[![CI](https://github.com/rsha/0800/actions/workflows/ci.yml/badge.svg)](https://github.com/rsha/0800/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/rsha/0800?color=7ee7d0)](https://github.com/rsha/0800/releases)
+[![CI](https://github.com/RshaCuDeVidro/0800/actions/workflows/ci.yml/badge.svg)](https://github.com/RshaCuDeVidro/0800/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/RshaCuDeVidro/0800?color=7ee7d0)](https://github.com/RshaCuDeVidro/0800/releases)
 [![Go](https://img.shields.io/badge/go-1.24%2B-7ee7d0)](https://go.dev)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -33,22 +33,22 @@ are not tripped.
 
 ## Screenshots
 
-| Remote file browser | Findings & evidence |
+| Exposure summary (`s`) | Remote file browser + findings |
 | --- | --- |
-| ![browser](docs/screenshots/browser.svg) | ![details](docs/screenshots/details.svg) |
+| ![summary](docs/screenshots/summary.svg) | ![browser](docs/screenshots/browser.svg) |
 
-| Help overlay |
-| --- |
-| ![help](docs/screenshots/help.svg) |
+| Host details (`tab`) | Help (`?`) |
+| --- | --- |
+| ![details](docs/screenshots/details.svg) | ![help](docs/screenshots/help.svg) |
 
 ## Install
 
 ```bash
 # go install (Go 1.24+)
-go install github.com/rsha/0800@latest
+go install github.com/RshaCuDeVidro/0800@latest
 
 # or download the archive for your OS/arch from
-# https://github.com/rsha/0800/releases  (linux|darwin|windows _ amd64|arm64)
+# https://github.com/RshaCuDeVidro/0800/releases  (linux|darwin|windows _ amd64|arm64)
 tar xzf 0800_linux_amd64.tar.gz
 sudo mv 0800 /usr/local/bin/
 ```
@@ -91,6 +91,7 @@ flags:
       --max-hosts      refuse to expand beyond this many targets (default 65536)
       --loot           download directory (default 0800-loot)
       --flat           download straight into the loot root
+      --remap          probe a non-standard port, e.g. smb=1445,ldap=1389
       --json           write a JSON report
       --plain          headless output
       --no-color       disable ANSI colours
@@ -106,11 +107,16 @@ flags:
 | `h` or `esc` | go back one level |
 | `g` | **get** the selected file |
 | `tab` | details pane (findings + evidence) |
+| `s` | exposure summary (severity, top hosts, services) |
 | `/` | filter hosts by IP, name or tag |
 | `a` | show every target, including silent ones |
 | `r` | reload the current directory |
 | `?` | help |
 | `q` | quit |
+
+The right pane is a live dashboard until you open a target: counters, the top exposures and a
+stream of the newest findings. Opening an SMB/NFS host splits it into a file tree and that host's
+findings.
 
 Downloads go to `0800-loot/<ip>/<share>/<path>/<file>` (use `--flat` for the current directory).
 Files are written to `.part` and renamed on completion, and existing names get a `(1)` suffix.
@@ -216,6 +222,8 @@ target.Parse ──► scan.Engine ──► proto probes ──► scan.Store �
   `atomic.Pointer[Snapshot]` at 10 Hz. No locks in the render path, no data races.
 - **Protocol independence in the browser**: SMB and NFS both implement `remoteFS`
   (`List`/`Open`/`Close`), so the file tree, breadcrumb and download code is shared.
+- **Live view**: counters, severity breakdown, top exposures and a finding feed are derived from
+  the same immutable snapshot, so the dashboard updates without extra locks.
 - **Fuzz-ready parsers**: every decoder that consumes hostile bytes has a fuzz target
   (`go test -fuzz`).
 
@@ -237,7 +245,7 @@ tools/
 ## Build
 
 ```bash
-git clone https://github.com/rsha/0800 && cd 0800
+git clone https://github.com/RshaCuDeVidro/0800 && cd 0800
 make build      # static binary, version from git
 make test       # go test -race ./...
 make lint       # gofmt + go vet
@@ -261,6 +269,19 @@ go test -run '^$' -fuzz FuzzParseDirEntries -fuzztime 20s ./internal/smb
 The test suite stands up **in-process fake servers** for SMB2, LDAP, ONC RPC/MOUNT/NFSv3, MySQL,
 PostgreSQL and Redis, then drives the real client code against them. That means the parsers,
 authentication flows and error paths are exercised without root, Docker or network access.
+
+### Local lab
+
+`tools/lab` starts deliberately vulnerable SMB, NFS, MySQL, PostgreSQL and Redis servers on
+`127.0.0.1`, so the whole pipeline can be exercised without touching anything real:
+
+```bash
+go run ./tools/lab        # terminal 1
+go run . -t 127.0.0.1 -p 3306,5432,6379,2049 --remap smb=1445 --plain
+```
+
+Expected result: SMB null session with two shares (one writable), two readable NFS exports and
+three passwordless databases.
 
 Optional integration run against a real lab:
 

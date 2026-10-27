@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rsha/0800/internal/scan"
+	"github.com/RshaCuDeVidro/0800/internal/scan"
 )
 
 // NewDemo builds a deterministic model for documentation, screenshots and UI
@@ -44,6 +44,7 @@ func NewDemo(width, height int, variant string) *Model {
 		KV: [][2]string{{"netbios", "CORP"}, {"dialect", "3.0.2"}, {"signing", "disabled"}},
 	})
 	st.AddFinding("192.0.2.10", scan.Finding{
+		At:   time.Now().Add(-42 * time.Second),
 		Port: 445, Proto: "smb", Kind: "smb-null", Label: "null session", Severity: scan.SevCritical,
 		Detail: "anonymous SMB session accepted · dialect 3.0.2 · signing disabled",
 		Evidence: []string{
@@ -56,6 +57,7 @@ func NewDemo(width, height int, variant string) *Model {
 		Detail: "4 share(s): C$, IPC$, NETLOGON, SYSVOL",
 	})
 	st.AddFinding("192.0.2.10", scan.Finding{
+		At:   time.Now().Add(-40 * time.Second),
 		Port: 389, Proto: "ldap", Kind: "ldap-anon", Label: "anon search", Severity: scan.SevHigh,
 		Detail: "anonymous bind returned 4 object(s) from DC=corp,DC=local",
 		Evidence: []string{
@@ -81,6 +83,7 @@ func NewDemo(width, height int, variant string) *Model {
 		},
 	})
 	st.AddFinding("192.0.2.24", scan.Finding{
+		At:   time.Now().Add(-34 * time.Second),
 		Port: 445, Proto: "smb", Kind: "smb-guest", Label: "guest login", Severity: scan.SevHigh,
 		Detail: "guest account accepted with empty password · dialect 2.1 · signing disabled",
 		Evidence: []string{
@@ -89,6 +92,7 @@ func NewDemo(width, height int, variant string) *Model {
 		},
 	})
 	st.AddFinding("192.0.2.24", scan.Finding{
+		At:   time.Now().Add(-33 * time.Second),
 		Port: 445, Proto: "smb", Kind: "smb-write", Label: "write access", Severity: scan.SevCritical,
 		Detail: "writable share(s) as unauthenticated user: storage",
 	})
@@ -109,6 +113,7 @@ func NewDemo(width, height int, variant string) *Model {
 		},
 	})
 	st.AddFinding("198.51.100.7", scan.Finding{
+		At:   time.Now().Add(-25 * time.Second),
 		Port: 2049, Proto: "nfs", Kind: "nfs-read", Label: "nfs read", Severity: scan.SevHigh,
 		Detail: "readable without credentials: /srv/backup (42 entries), /srv/media (9 entries)",
 		Evidence: []string{
@@ -125,6 +130,7 @@ func NewDemo(width, height int, variant string) *Model {
 		Detail: []string{"trust authentication for postgres", "server_version 16.2"},
 	})
 	st.AddFinding("198.51.100.42", scan.Finding{
+		At:   time.Now().Add(-18 * time.Second),
 		Port: 5432, Proto: "postgres", Kind: "postgres-open", Label: "postgres open",
 		Severity: scan.SevCritical,
 		Detail:   `postgres accepted user "postgres" with an empty password`,
@@ -139,6 +145,7 @@ func NewDemo(width, height int, variant string) *Model {
 		Detail: []string{"PING answered without credentials", "dbsize 1284"},
 	})
 	st.AddFinding("203.0.113.9", scan.Finding{
+		At:   time.Now().Add(-9 * time.Second),
 		Port: 6379, Proto: "redis", Kind: "redis-open", Label: "redis open",
 		Severity: scan.SevCritical, Detail: "PING answered without credentials",
 		Evidence: []string{"+PONG", "INFO server -> redis_version:7.2.4"},
@@ -169,6 +176,11 @@ func NewDemo(width, height int, variant string) *Model {
 		NFSTimeout: 8 * time.Second,
 	})
 
+	// A live-looking sample rate for screenshots.
+	m.rate = 24.6
+	m.lastRateAt = time.Now()
+	m.lastDone = m.snap.Done
+
 	switch variant {
 	case "browser":
 		m.cursor = indexOf(m.hosts, "192.0.2.24")
@@ -196,6 +208,9 @@ func NewDemo(width, height int, variant string) *Model {
 		m.cursor = indexOf(m.hosts, "192.0.2.10")
 		m.showDetails = true
 		m.focus = 1
+
+	case "summary":
+		m.showSummary = true
 
 	case "help":
 		m.showHelp = true

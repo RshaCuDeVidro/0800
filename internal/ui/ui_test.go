@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/RshaCuDeVidro/0800/internal/scan"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/rsha/0800/internal/scan"
 )
 
 func writeFile(p string) error {

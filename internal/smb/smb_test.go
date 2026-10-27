@@ -439,11 +439,15 @@ func TestType3Shape(t *testing.T) {
 		t.Errorf("anonymous NT response length = %d, want 0", n)
 	}
 	guest := type3("guest", "CORP", ch, false)
-	if n := u16(guest, 20); n != 24 {
-		t.Errorf("guest NT response length = %d, want 24", n)
+	n := int(u16(guest, 20))
+	if n < 32 || n != len(guest)-64-int(u16(guest, 28))-int(u16(guest, 36))-int(u16(guest, 44)) {
+		t.Errorf("guest NT response length = %d (message %d bytes)", n, len(guest))
 	}
-	if guest[64+24] == 0 {
-		t.Error("guest payload missing domain")
+	if string(guest[64+16:64+20]) != "\x01\x01\x00\x00" {
+		t.Errorf("missing NTLMv2 blob signature: %x", guest[64+16:64+20])
+	}
+	if u32(guest, 60)&0x00080000 == 0 {
+		t.Error("NTLMv2 response must advertise extended session security")
 	}
 }
 
