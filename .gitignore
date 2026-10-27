@@ -1,0 +1,15 @@
+# binaries
+/0800
+/0800.exe
+/dist/
+
+# runtime output
+/0800-loot/
+*.part
+scan.json
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
