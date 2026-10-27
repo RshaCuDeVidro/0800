@@ -7,6 +7,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -49,15 +50,33 @@ func ProbeHost(ctx context.Context, ip string, cfg Config) (*Probe, error) {
 	addr := cfg.address(ip)
 	p := &Probe{}
 
-	// SMB1 is probed on its own connection: servers that disabled it may reset.
-	if c, err := dial(ctx, addr, cfg); err == nil {
-		ok, signing, err := c.negotiateSMB1(ctx)
-		_ = c.Close()
-		if err == nil && ok {
-			p.SMB1 = true
-			p.SMB1Signing = signing
-		}
+	// SMB1 is probed on its own connection (servers that disabled it may reset
+	// the socket) and concurrently with the SMB2 handshake, so it costs latency
+	// only once.
+	type smb1Result struct {
+		ok      bool
+		signing string
 	}
+	smb1ch := make(chan smb1Result, 1)
+	go func() {
+		var r smb1Result
+		if c, err := dial(ctx, addr, cfg); err == nil {
+			r.ok, r.signing, _ = c.negotiateSMB1(ctx)
+			_ = c.Close()
+		}
+		smb1ch <- r
+	}()
+	var smb1Once sync.Once
+	var smb1 smb1Result
+	getSMB1 := func() smb1Result {
+		smb1Once.Do(func() { smb1 = <-smb1ch })
+		return smb1
+	}
+	defer func() {
+		r := getSMB1()
+		p.SMB1 = r.ok
+		p.SMB1Signing = r.signing
+	}()
 
 	authKinds := []string{"null", "guest"}
 	var lastErr error
@@ -109,7 +128,13 @@ func ProbeHost(ctx context.Context, ip string, cfg Config) (*Probe, error) {
 	if kind := p.AuthKind(); kind != "" && p.Signing != "required" {
 		cl, err := Connect(ctx, ip, kind, cfg)
 		if err == nil {
-			shares, err := cl.ListShares(ctx)
+			enumCtx := ctx
+			cancel := func() {}
+			if cfg.EnumTimeout > 0 {
+				enumCtx, cancel = context.WithTimeout(ctx, cfg.EnumTimeout)
+			}
+			shares, err := cl.ListShares(enumCtx, cfg.ShareMode)
+			cancel()
 			if err != nil {
 				p.EnumErr = err.Error()
 			} else {
@@ -182,21 +207,32 @@ func (c *Client) Close() error {
 	return c.c.Close()
 }
 
-// ListShares enumerates shares. It first asks srvsvc over IPC$ and falls back
-// to probing well known share names when RPC is blocked.
-func (c *Client) ListShares(ctx context.Context) ([]Share, error) {
+// ListShares enumerates shares. It first asks srvsvc over IPC$; when RPC is
+// blocked and mode allows it, it probes a curated list of share names (one
+// round trip each, so the scan uses the short list and the browser the full).
+func (c *Client) ListShares(ctx context.Context, mode ShareMode) ([]Share, error) {
 	shares, err := c.srvsvcListShares(ctx)
 	if err == nil && len(shares) > 0 {
 		return shares, nil
 	}
-	fallback := c.probeCommonShares(ctx)
-	if len(fallback) == 0 {
+	if mode == SharesOff {
 		if err != nil {
 			return nil, err
 		}
 		return nil, errors.New("share enumeration denied")
 	}
-	return fallback, nil
+	names := quickShareNames
+	if mode == SharesFull {
+		names = commonShareNames
+	}
+	fb := c.probeCommonShares(ctx, names)
+	if len(fb) == 0 {
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("share enumeration denied")
+	}
+	return fb, nil
 }
 
 // ReadDir lists a directory inside a share. An empty dir means the share root.
@@ -261,10 +297,10 @@ func (c *Client) connectShare(ctx context.Context, share string) (treeConn, erro
 
 // probeCommonShares tries a curated list of share names. This is the fallback
 // when srvsvc is unavailable, and it is also how writable shares are detected.
-func (c *Client) probeCommonShares(ctx context.Context) []Share {
+func (c *Client) probeCommonShares(ctx context.Context, names []string) []Share {
 	var out []Share
 	seen := map[string]bool{}
-	for _, name := range commonShareNames {
+	for _, name := range names {
 		if ctx.Err() != nil {
 			break
 		}
@@ -281,6 +317,14 @@ func (c *Client) probeCommonShares(ctx context.Context) []Share {
 		out = append(out, Share{Name: name, Type: typ, Writable: access&0x2 != 0})
 	}
 	return out
+}
+
+// quickShareNames is the short list used during a scan: the most common
+// appliance/server shares, 14 round trips at most.
+var quickShareNames = []string{
+	"IPC$", "C$", "ADMIN$", "SYSVOL", "NETLOGON",
+	"public", "storage", "share", "shared", "users",
+	"home", "data", "backup", "print$",
 }
 
 var commonShareNames = []string{

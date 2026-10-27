@@ -17,6 +17,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/RshaCuDeVidro/0800/internal/report"
 	"github.com/RshaCuDeVidro/0800/internal/scan"
 	"github.com/RshaCuDeVidro/0800/internal/smb"
 )
@@ -31,6 +32,9 @@ type Config struct {
 	NFSTimeout time.Duration
 	Width      int
 	Height     int
+	Workers    int
+	// Cancel stops the running scan (key: x).
+	Cancel func()
 }
 
 // Model is the Bubble Tea application state.
@@ -64,6 +68,10 @@ type Model struct {
 	lastDone   int
 	lastRateAt time.Time
 
+	sortMode  int
+	listState listState
+	lastBuild time.Time
+
 	showHelp bool
 
 	toastText string
@@ -81,6 +89,26 @@ type downloadedMsg struct {
 	size int64
 	err  error
 }
+
+type exportedMsg struct {
+	json string
+	md   string
+	err  error
+}
+
+// listState is the cheap signature used to decide whether the visible list has
+// to be rebuilt and re-sorted.
+type listState struct {
+	n, done, open, findings int
+	filter                  string
+	all                     bool
+}
+
+const (
+	sortIP = iota
+	sortSeverity
+	sortFindings
+)
 
 // New builds the TUI model.
 func New(cfg Config) *Model {
@@ -164,6 +192,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case sharesMsg:
+		m.browser.applyShares(msg)
+		if msg.err != nil {
+			m.toast("share enumeration failed: "+msg.err.Error(), scan.SevHigh)
+		}
+		return m, nil
+
+	case exportedMsg:
+		if msg.err != nil {
+			m.toast("export failed: "+msg.err.Error(), scan.SevHigh)
+		} else {
+			m.toast("report saved: "+msg.json+" · "+msg.md, scan.SevInfo)
+		}
+		return m, nil
+
 	case downloadedMsg:
 		if msg.err != nil {
 			m.toast("download failed: "+msg.err.Error(), scan.SevHigh)
@@ -234,6 +277,19 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "a":
 		m.allHosts = !m.allHosts
 		m.refresh()
+		return m, nil
+	case "o":
+		m.sortMode = (m.sortMode + 1) % 3
+		m.listState = listState{filter: "!"} // force a rebuild
+		m.refresh()
+		return m, nil
+	case "e":
+		return m, m.export()
+	case "x":
+		if m.scanning && m.cfg.Cancel != nil {
+			m.cfg.Cancel()
+			m.toast("stopping scan…", scan.SevInfo)
+		}
 		return m, nil
 	case "/":
 		m.filtering = true
@@ -386,6 +442,20 @@ func (m *Model) refresh() {
 		m.rate = 0
 	}
 
+	sig := listState{
+		n: len(snap.Hosts), done: snap.Done, open: snap.Open,
+		findings: snap.Findings, filter: m.filter, all: m.allHosts,
+	}
+	if sig == m.listState {
+		return
+	}
+	// With a non-default sort a full rebuild costs O(n log n). Throttle it so a
+	// 65k-host scan does not re-sort ten times per second.
+	force := sig.filter != m.listState.filter || sig.all != m.listState.all
+	if m.sortMode != sortIP && !force && now.Sub(m.lastBuild) < 250*time.Millisecond {
+		return
+	}
+
 	prevIP := ""
 	if h := m.selected(); h != nil {
 		prevIP = h.IP
@@ -402,7 +472,26 @@ func (m *Model) refresh() {
 		}
 		m.hosts = append(m.hosts, h)
 	}
-	sort.SliceStable(m.hosts, func(i, j int) bool { return lessIPv4(m.hosts[i].IP, m.hosts[j].IP) })
+
+	switch m.sortMode {
+	case sortSeverity:
+		sort.SliceStable(m.hosts, func(i, j int) bool {
+			if m.hosts[i].Sev != m.hosts[j].Sev {
+				return m.hosts[i].Sev > m.hosts[j].Sev
+			}
+			if m.hosts[i].Discovered() != m.hosts[j].Discovered() {
+				return m.hosts[i].Discovered() > m.hosts[j].Discovered()
+			}
+			return lessIPv4(m.hosts[i].IP, m.hosts[j].IP)
+		})
+	case sortFindings:
+		sort.SliceStable(m.hosts, func(i, j int) bool {
+			if len(m.hosts[i].Findings) != len(m.hosts[j].Findings) {
+				return len(m.hosts[i].Findings) > len(m.hosts[j].Findings)
+			}
+			return lessIPv4(m.hosts[i].IP, m.hosts[j].IP)
+		})
+	}
 
 	if prevIP != "" {
 		for i, h := range m.hosts {
@@ -412,6 +501,8 @@ func (m *Model) refresh() {
 			}
 		}
 	}
+	m.listState = sig
+	m.lastBuild = now
 	m.clampCursor()
 }
 
@@ -598,10 +689,17 @@ func (m *Model) hostPanel(w, h int, focused bool) string {
 }
 
 func (m *Model) listTitle() string {
-	if m.filter != "" {
-		return "targets · /" + m.filter
+	title := "targets"
+	switch m.sortMode {
+	case sortSeverity:
+		title += " · sev"
+	case sortFindings:
+		title += " · hits"
 	}
-	return "targets"
+	if m.filter != "" {
+		title += " · /" + m.filter
+	}
+	return title
 }
 
 func (m *Model) listRight() string {
@@ -757,7 +855,8 @@ func (m *Model) footer() string {
 	type hint struct{ k, d string }
 	hints := []hint{
 		{"j/k", "move"}, {"↵", "open"}, {"h", "back"}, {"g", "get"},
-		{"tab", "details"}, {"/", "filter"}, {"s", "summary"}, {"?", "help"}, {"q", "quit"},
+		{"s", "summary"}, {"tab", "details"}, {"/", "filter"},
+		{"e", "report"}, {"o", "sort"}, {"x", "stop"}, {"?", "help"}, {"q", "quit"},
 	}
 	var b strings.Builder
 	used := 0
@@ -804,8 +903,8 @@ func (m *Model) statusLine() string {
 	h := m.selected()
 	if h == nil {
 		if m.snap != nil {
-			return styleDim.Render(fmt.Sprintf(" %d targets · %d scanned · %d ports open · %d findings",
-				m.snap.Total, m.snap.Done, m.snap.Open, m.snap.Findings))
+			return styleDim.Render(fmt.Sprintf(" %d targets · %d scanned · %d ports open · %d findings · %d workers",
+				m.snap.Total, m.snap.Done, m.snap.Open, m.snap.Findings, m.cfg.Workers))
 		}
 		return ""
 	}
@@ -847,6 +946,9 @@ func (m *Model) helpView(h int) string {
 		{"g", "download the selected file"},
 		{"tab", "toggle the details pane"},
 		{"s", "summary: severity, top exposures, services"},
+		{"e", "export JSON + Markdown report"},
+		{"o", "cycle sort: ip / severity / findings"},
+		{"x", "stop the running scan"},
 		{"/", "filter hosts by ip, name or tag"},
 		{"a", "show every target, including silent ones"},
 		{"r", "reload the current directory"},
@@ -867,6 +969,25 @@ func (m *Model) helpView(h int) string {
 	lines = append(lines, "  "+styleWarn.Render("Use only against systems you are authorised to test."))
 	lines = append(lines, "  "+styleFaint.Render("downloads are written to: "+m.cfg.LootDir))
 	return panel("help", "any key closes", strings.Join(lines, "\n"), m.w, h, true)
+}
+
+// export writes a JSON and a Markdown report next to the working directory.
+func (m *Model) export() tea.Cmd {
+	snap := m.snap
+	ver := m.cfg.Version
+	return func() tea.Msg {
+		if snap == nil {
+			return exportedMsg{err: fmt.Errorf("nothing scanned yet")}
+		}
+		doc := report.Build(snap, ver)
+		if err := report.WriteJSON("0800-report.json", doc); err != nil {
+			return exportedMsg{err: err}
+		}
+		if err := report.WriteMarkdown("0800-report.md", doc); err != nil {
+			return exportedMsg{err: err}
+		}
+		return exportedMsg{json: "0800-report.json", md: "0800-report.md"}
+	}
 }
 
 // --- downloads ------------------------------------------------------------

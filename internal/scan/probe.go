@@ -63,6 +63,11 @@ func (e *Engine) probeSMB(ctx context.Context, ip string, port int) {
 	cfg.Port = port
 	cfg.DialTimeout = e.cfg.DialTimeout
 	cfg.IOTimeout = e.cfg.IOTimeout
+	cfg.EnumTimeout = minDuration(3*time.Second, e.cfg.IOTimeout)
+	cfg.ShareMode = smb.SharesOff
+	if e.cfg.EnumShares {
+		cfg.ShareMode = smb.SharesQuick
+	}
 
 	p, err := smb.ProbeHost(ctx, ip, cfg)
 	if err != nil {
@@ -189,6 +194,13 @@ func (e *Engine) probeSMB(ctx context.Context, ip string, port int) {
 			},
 		})
 	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (e *Engine) probeLDAP(ctx context.Context, ip string, port int) {

@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/RshaCuDeVidro/0800/internal/preset"
 	"github.com/RshaCuDeVidro/0800/internal/report"
 	"github.com/RshaCuDeVidro/0800/internal/scan"
 	"github.com/RshaCuDeVidro/0800/internal/smb"
@@ -23,9 +24,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
+	"golang.org/x/term"
 )
 
-var version = "0.1.0"
+var version = "0.2.0"
 
 type stringList []string
 
@@ -47,10 +49,10 @@ func run() error {
 		targets     stringList
 		exclude     stringList
 		portsFlag   = flag.String("p", "445,88,389,2049,3306,5432,6379", "comma separated ports to test")
-		timeout     = flag.Duration("timeout", 700*time.Millisecond, "TCP dial timeout")
-		ioTimeout   = flag.Duration("io-timeout", 6*time.Second, "per protocol I/O timeout")
-		concurrency = flag.Int("c", 512, "parallel TCP workers")
-		probes      = flag.Int("probe-workers", 24, "parallel protocol workers")
+		timeout     = flag.Duration("timeout", 500*time.Millisecond, "TCP dial timeout")
+		ioTimeout   = flag.Duration("io-timeout", 4*time.Second, "per protocol I/O timeout")
+		concurrency = flag.Int("c", 1024, "parallel TCP workers")
+		probes      = flag.Int("probe-workers", 64, "parallel protocol workers")
 		rate        = flag.Int("rate", 0, "max dials per second (0 = unlimited)")
 		remap       = flag.String("remap", "", "probe a non-standard port, e.g. smb=1445,ldap=1389")
 		maxHosts    = flag.Int("max-hosts", 65536, "refuse to expand more than this many targets")
@@ -58,6 +60,9 @@ func run() error {
 		flat        = flag.Bool("flat", false, "download straight into the loot root")
 		jsonPath    = flag.String("json", "", "write a JSON report to this path")
 		plain       = flag.Bool("plain", false, "headless output, no TUI")
+		profile     = flag.String("profile", "", "port preset: full, quick, ad, smb, db")
+		enumShares  = flag.Bool("enum-shares", true, "enumerate shares during the scan (short list)")
+		menu        = flag.Bool("menu", false, "always show the interactive setup screen")
 		noColor     = flag.Bool("no-color", false, "disable ANSI colours")
 		demo        = flag.Bool("demo", false, "run the TUI with built-in example data")
 		width       = flag.Int("width", 0, "override terminal width (demo/screenshots)")
@@ -83,7 +88,48 @@ func run() error {
 		return runDemo(*width, *height)
 	}
 
-	portList, err := parsePorts(*portsFlag)
+	// A profile sets the port list unless -p was given explicitly.
+	pSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "p" {
+			pSet = true
+		}
+	})
+	if *profile != "" {
+		pre, ok := preset.Find(*profile)
+		if !ok {
+			return fmt.Errorf("unknown profile %q (want %s)", *profile, strings.Join(preset.Names(), ", "))
+		}
+		if !pSet {
+			*portsFlag = pre.Format()
+		}
+	}
+
+	if *menu || (len(targets) == 0 && !*demo && !*showVersion) {
+		if !term.IsTerminal(int(os.Stdin.Fd())) {
+			flag.Usage()
+			return errors.New("no targets given (interactive setup needs a terminal)")
+		}
+		setup, err := ui.RunWizard(version, ui.Setup{
+			TargetSpec: strings.Join(targets, ","),
+			Workers:    *concurrency,
+			Rate:       *rate,
+			EnumShares: *enumShares,
+		})
+		if err != nil {
+			return err
+		}
+		if setup == nil {
+			return nil
+		}
+		targets = stringList(setup.Targets)
+		*portsFlag = joinInts(setup.Ports)
+		*concurrency = setup.Workers
+		*rate = setup.Rate
+		*enumShares = setup.EnumShares
+	}
+
+	portList, err := preset.ParsePorts(*portsFlag)
 	if err != nil {
 		return err
 	}
@@ -124,8 +170,8 @@ func run() error {
 	defer stop()
 
 	fmt.Fprintf(os.Stderr, "%s %s\n", uiWordmark(), version)
-	fmt.Fprintf(os.Stderr, "  %d target(s) · ports %s · %d workers\n\n",
-		len(ips), *portsFlag, *concurrency)
+	fmt.Fprintf(os.Stderr, "  %d target(s) · ports %s · %d workers · %d probes\n\n",
+		len(ips), *portsFlag, *concurrency, *probes)
 
 	cfg := scan.Config{
 		Targets:      ips,
@@ -136,6 +182,7 @@ func run() error {
 		ProbeWorkers: *probes,
 		Rate:         *rate,
 		ServicePorts: servicePorts,
+		EnumShares:   *enumShares,
 	}
 
 	if *plain {
@@ -158,6 +205,9 @@ func run() error {
 		return nil
 	}
 
+	scanCtx, cancelScan := context.WithCancel(ctx)
+	defer cancelScan()
+
 	eng := scan.New(cfg)
 	model := ui.New(ui.Config{
 		Store:      eng.Store(),
@@ -166,15 +216,21 @@ func run() error {
 		Version:    version,
 		SMB:        smbCfg,
 		NFSTimeout: *ioTimeout,
+		Workers:    *concurrency,
+		Cancel:     cancelScan,
 	})
 
 	go func() {
-		if err := eng.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := eng.Run(scanCtx); err != nil && !errors.Is(err, context.Canceled) {
 			fmt.Fprintln(os.Stderr, "0800:", err)
 		}
 	}()
 
-	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithContext(ctx))
+	p := tea.NewProgram(model, tea.WithAltScreen())
+	go func() {
+		<-ctx.Done()
+		p.Quit()
+	}()
 	if _, err := p.Run(); err != nil {
 		return err
 	}
@@ -250,27 +306,12 @@ func containsPort(list []int, p int) bool {
 	return false
 }
 
-func parsePorts(s string) ([]int, error) {
-	var out []int
-	seen := map[int]bool{}
-	for _, p := range strings.Split(s, ",") {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		n, err := strconv.Atoi(p)
-		if err != nil || n < 1 || n > 65535 {
-			return nil, fmt.Errorf("invalid port %q", p)
-		}
-		if !seen[n] {
-			seen[n] = true
-			out = append(out, n)
-		}
+func joinInts(v []int) string {
+	parts := make([]string, 0, len(v))
+	for _, n := range v {
+		parts = append(parts, strconv.Itoa(n))
 	}
-	if len(out) == 0 {
-		return nil, errors.New("no ports to scan")
-	}
-	return out, nil
+	return strings.Join(parts, ",")
 }
 
 func severityPrefix(h *scan.HostView) string {
@@ -292,6 +333,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `0800 %s — null authentication recon
 
 usage:
+  0800                       interactive setup
   0800 -t <target>... [flags]
 
 targets:
@@ -299,7 +341,8 @@ targets:
       --exclude    CIDR or IP to skip (repeatable)
 
 examples:
-  0800 -t 10.0.0.0/24
+  0800                                # setup menu
+  0800 -t 10.0.0.0/24 --profile quick
   0800 -t hosts.txt --plain
   0800 -t 192.0.2.10 -p 445,389 --json out.json
   0800 -t 10.0.0.0/24 --plain | tee scan.log

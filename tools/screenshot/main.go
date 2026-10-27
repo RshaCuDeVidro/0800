@@ -31,8 +31,13 @@ func main() {
 
 	lipgloss.SetColorProfile(termenv.TrueColor)
 
-	m := ui.NewDemo(*width, *height, *view)
-	v := m.View()
+	var v string
+	if *view == "setup" {
+		v = ui.NewWizardPreview(*width, *height).View()
+	} else {
+		m := ui.NewDemo(*width, *height, *view)
+		v = m.View()
+	}
 
 	if *raw {
 		fmt.Print(stripANSI(v))

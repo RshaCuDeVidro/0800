@@ -180,7 +180,7 @@ func meter(n, total, w int) string {
 	if filled > w {
 		filled = w
 	}
-	return styleAccent.Render(strings.Repeat("█", filled)) + styleFaint.Render(strings.Repeat("░", w-filled))
+	return styleAccent.Render(strings.Repeat("█", filled)) + styleFaint.Render(strings.Repeat("·", w-filled))
 }
 
 // twoColumns joins two blocks line by line.
