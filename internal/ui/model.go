@@ -649,7 +649,22 @@ func (m *Model) main(h int) string {
 			right = m.browser.render(rightW, h, m.focus == 1)
 		}
 	default:
-		right = renderDashboard(m.snap, rightW, h, false)
+		sel := m.selected()
+		if sel == nil {
+			right = renderDashboard(m.snap, rightW, h, false, false)
+			break
+		}
+		// Keep the live feed on top and preview the selected host below it.
+		prevH := min(len(sel.Findings)*2+8, h*45/100)
+		prevH = max(prevH, 9)
+		dashH := h - prevH
+		if dashH < 12 {
+			right = renderSelection(sel, rightW, h, m.focus == 1)
+			break
+		}
+		right = lipgloss.JoinVertical(lipgloss.Left,
+			renderDashboard(m.snap, rightW, dashH, false, true),
+			renderSelection(sel, rightW, prevH, m.focus == 1))
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
 }
@@ -939,36 +954,51 @@ func (m *Model) tooSmall() string {
 }
 
 func (m *Model) helpView(h int) string {
-	rows := [][2]string{
-		{"j / k", "move selection down / up"},
-		{"↵ or l", "open share, directory or host"},
+	nav := [][2]string{
+		{"j / k", "move selection"},
+		{"↵ or l", "open share / directory"},
 		{"h or esc", "go back one level"},
-		{"g", "download the selected file"},
-		{"tab", "toggle the details pane"},
-		{"s", "summary: severity, top exposures, services"},
-		{"e", "export JSON + Markdown report"},
-		{"o", "cycle sort: ip / severity / findings"},
-		{"x", "stop the running scan"},
-		{"/", "filter hosts by ip, name or tag"},
-		{"a", "show every target, including silent ones"},
-		{"r", "reload the current directory"},
-		{"?", "this help"},
+		{"g", "download the file"},
+		{"tab", "host details"},
+		{"s", "exposure summary"},
+		{"/", "filter targets"},
+	}
+	act := [][2]string{
+		{"e", "export json + markdown"},
+		{"o", "sort: ip / sev / hits"},
+		{"x", "stop the scan"},
+		{"a", "show silent targets"},
+		{"r", "reload directory"},
+		{"?", "close this help"},
 		{"q", "quit"},
 	}
-	var lines []string
-	lines = append(lines, "")
-	lines = append(lines, styleAccent.Render("  navigation"))
-	for _, r := range rows {
-		lines = append(lines, "  "+styleKey.Render(pad(r[0], 10))+styleText.Render(r[1]))
+	col := func(rows [][2]string) []string {
+		out := make([]string, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, styleKey.Render(pad(r[0], 9))+styleText.Render(r[1]))
+		}
+		return out
 	}
-	lines = append(lines, "")
-	lines = append(lines, styleAccent.Render("  about"))
-	lines = append(lines, "  "+styleText.Render("0800 finds services that answer without credentials."))
-	lines = append(lines, "  "+styleDim.Render("SMB null/guest · LDAP anonymous bind · NFS exports · open databases"))
-	lines = append(lines, "")
-	lines = append(lines, "  "+styleWarn.Render("Use only against systems you are authorised to test."))
-	lines = append(lines, "  "+styleFaint.Render("downloads are written to: "+m.cfg.LootDir))
-	return panel("help", "any key closes", strings.Join(lines, "\n"), m.w, h, true)
+	left, right := col(nav), col(act)
+
+	w := min(84, m.w-4)
+	inner := w - 4
+	lw := inner/2 - 3
+	rw := inner - lw - 4
+
+	body := "\n" + twoColumns(
+		append([]string{section("navigation"), ""}, left...),
+		append([]string{section("actions"), ""}, right...),
+		lw, rw, 4)
+	body += "\n\n" + section("about") + "\n" +
+		styleText.Render("0800 finds services that answer without credentials.") + "\n" +
+		styleDim.Render("SMB null/guest · LDAP anonymous bind · NFS exports · open databases") + "\n\n" +
+		styleWarn.Render("Use only against systems you are authorised to test.") + "\n" +
+		styleFaint.Render("downloads: "+m.cfg.LootDir+"  ·  reports: ./0800-report.{json,md}")
+
+	height := min(h, lipgloss.Height(body)+5)
+	box := panel("help", "esc closes", body, w, height, true)
+	return lipgloss.Place(m.w, h, lipgloss.Center, lipgloss.Center, box)
 }
 
 // export writes a JSON and a Markdown report next to the working directory.

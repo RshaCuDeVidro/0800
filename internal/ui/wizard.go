@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"net"
+	"os"
 	"strconv"
 	"strings"
 
@@ -20,6 +22,13 @@ type Setup struct {
 	Workers    int
 	Rate       int
 	EnumShares bool
+
+	// Set marks values that came from an explicit command line flag and must
+	// not be overridden by the saved preferences.
+	PortsSet   bool
+	WorkersSet bool
+	RateSet    bool
+	EnumSet    bool
 }
 
 type wizardModel struct {
@@ -44,6 +53,36 @@ type wizardModel struct {
 const wizardFields = 6
 
 func newWizard(version string, d Setup) *wizardModel {
+	p := loadPrefs()
+	if d.TargetSpec == "" {
+		d.TargetSpec = p.Target
+	}
+	if !d.WorkersSet && p.Workers > 0 {
+		d.Workers = p.Workers
+	}
+	if !d.RateSet {
+		d.Rate = p.Rate
+	}
+	if !d.EnumSet {
+		d.EnumShares = p.EnumShares
+	}
+
+	// Ports: explicit flag > saved ports > saved profile > full preset.
+	ports := d.Ports
+	if !d.PortsSet {
+		switch {
+		case len(p.Ports) > 0:
+			ports = p.Ports
+		case p.Profile != "":
+			if i := profileByName(p.Profile); i >= 0 {
+				ports = preset.All[i].Ports
+			}
+		}
+	}
+	if len(ports) == 0 {
+		ports = preset.All[0].Ports
+	}
+
 	mk := func(placeholder, value string) textinput.Model {
 		t := textinput.New()
 		t.Prompt = ""
@@ -57,18 +96,11 @@ func newWizard(version string, d Setup) *wizardModel {
 		return t
 	}
 
-	m := &wizardModel{version: version}
+	m := &wizardModel{version: version, profile: profileIndex(ports)}
 	m.target = mk("10.0.0.0/24, 192.0.2.10 or hosts.txt", d.TargetSpec)
-	m.ports = mk("445,389,…", preset.All[0].Format())
+	m.ports = mk("445,389,…", csvPorts(ports))
 	m.workers = mk("1024", "1024")
 	m.rate = mk("0", "0")
-	if len(d.Ports) > 0 {
-		parts := make([]string, 0, len(d.Ports))
-		for _, p := range d.Ports {
-			parts = append(parts, strconv.Itoa(p))
-		}
-		m.ports.SetValue(strings.Join(parts, ","))
-	}
 	if d.Workers > 0 {
 		m.workers.SetValue(strconv.Itoa(d.Workers))
 	}
@@ -125,11 +157,11 @@ func (m *wizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "left":
-			if m.focus == 1 {
+			switch m.focus {
+			case 1:
 				m.setProfile(m.profile - 1)
 				return m, nil
-			}
-			if m.focus == 5 {
+			case 5:
 				m.enum = !m.enum
 				return m, nil
 			}
@@ -223,18 +255,24 @@ func (m *wizardModel) start() {
 		Targets: ips, TargetSpec: spec, Ports: ports,
 		Workers: workers, Rate: rate, EnumShares: m.enum,
 	}
+	savePrefs(prefs{
+		Target: spec, Profile: preset.All[m.profile].Name, Ports: ports,
+		Workers: workers, Rate: rate, EnumShares: m.enum,
+	})
 	m.done = true
 }
 
 func (m *wizardModel) View() string {
 	if m.w == 0 || m.h == 0 {
-		m.w, m.h = 86, 26
+		m.w, m.h = 96, 30
 	}
 
-	w := min(80, m.w-4)
-	if w < 50 {
+	w := min(84, m.w-4)
+	if w < 54 {
 		w = max(40, m.w-2)
 	}
+	m.target.Width = max(18, w-40)
+	m.ports.Width = max(18, w-26)
 
 	label := func(i int, name string) string {
 		if m.focus == i {
@@ -248,11 +286,9 @@ func (m *wizardModel) View() string {
 		}
 		v := in.Value()
 		if v == "" {
-			v = styleFaint.Render(in.Placeholder)
-		} else {
-			v = styleText.Render(v)
+			return styleFaint.Render(in.Placeholder)
 		}
-		return v
+		return styleText.Render(v)
 	}
 	hint := func(text string) string { return styleFaint.Render("  " + text) }
 
@@ -262,9 +298,14 @@ func (m *wizardModel) View() string {
 		profileLine = styleDim.Render("‹ ") + styleText.Render(p.Name) + styleDim.Render(" ›")
 	}
 
-	enumBox := "[ ]"
+	enumBox := styleDim.Render("[ ]")
 	if m.enum {
 		enumBox = styleAccent.Render("[x]")
+	}
+
+	targetLine := label(0, "target") + value(0, m.target)
+	if est := estimateHosts(m.target.Value()); est != "" {
+		targetLine = spread(targetLine, styleFaint.Render(est), w-6)
 	}
 
 	lines := []string{
@@ -272,7 +313,7 @@ func (m *wizardModel) View() string {
 		styleAccent.Bold(true).Render("0800") + styleSubtitle.Render("  null-auth recon"),
 		styleFaint.Render("interactive setup · v" + m.version),
 		"",
-		label(0, "target") + value(0, m.target),
+		targetLine,
 		hint("ip, cidr, hostname, file or @file"),
 		"",
 		label(1, "profile") + profileLine + styleDim.Render("   "+p.Desc),
@@ -281,13 +322,13 @@ func (m *wizardModel) View() string {
 		"",
 		label(3, "workers") + value(3, m.workers) + styleFaint.Render("   parallel tcp workers"),
 		label(4, "rate") + value(4, m.rate) + styleFaint.Render("   dials per second, 0 = unlimited"),
-		label(5, "shares") + enumBox + styleFaint.Render("   enumerate shares during the scan (slower)"),
+		label(5, "shares") + enumBox + styleFaint.Render("   enumerate shares during the scan"),
 		"",
 	}
 	if m.err != "" {
 		lines = append(lines, styleErr.Render("  ! "+m.err))
 	} else {
-		lines = append(lines, styleFaint.Render("  every probe is read-only; at most two auth attempts per host."))
+		lines = append(lines, styleFaint.Render("  read-only probes · at most two auth attempts per host"))
 	}
 	lines = append(lines, "")
 	lines = append(lines, spread(
@@ -295,16 +336,76 @@ func (m *wizardModel) View() string {
 			"   "+styleKey.Render("←/→")+" "+styleKeyDesc.Render("profile")+
 			"   "+styleKey.Render("enter")+" "+styleKeyDesc.Render("start")+
 			"   "+styleKey.Render("esc")+" "+styleKeyDesc.Render("quit"),
-		styleFaint.Render("0800 v"+m.version),
-		w-4))
+		styleFaint.Render("remembered in ~/.config/0800"),
+		w-6))
 
 	box := panel("setup", "read-only recon", strings.Join(lines, "\n"), w, len(lines)+4, true)
 	return lipgloss.Place(max(m.w, w), max(m.h, len(lines)+6), lipgloss.Center, lipgloss.Center, box)
 }
 
+func csvPorts(ports []int) string {
+	parts := make([]string, 0, len(ports))
+	for _, p := range ports {
+		parts = append(parts, strconv.Itoa(p))
+	}
+	return strings.Join(parts, ",")
+}
+
+func profileIndex(ports []int) int {
+	for i, p := range preset.All {
+		if len(p.Ports) == len(ports) {
+			same := true
+			for j := range ports {
+				if p.Ports[j] != ports[j] {
+					same = false
+					break
+				}
+			}
+			if same {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
+func profileByName(name string) int {
+	for i, p := range preset.All {
+		if strings.EqualFold(p.Name, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+// estimateHosts gives a cheap, non-blocking size hint for the target field.
+func estimateHosts(spec string) string {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return ""
+	}
+	if _, n, err := net.ParseCIDR(spec); err == nil {
+		ones, bits := n.Mask.Size()
+		count := 1 << (bits - ones)
+		if bits == 32 && count > 65536 {
+			return "too large"
+		}
+		return "≈ " + itoa(count) + " hosts"
+	}
+	if net.ParseIP(spec) != nil {
+		return "1 host"
+	}
+	if st, err := os.Stat(spec); err == nil && !st.IsDir() {
+		return "file"
+	}
+	return ""
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
+
 // NewWizardPreview builds a wizard for screenshots and docs.
 func NewWizardPreview(w, h int) tea.Model {
-	m := newWizard("0.2.0", Setup{TargetSpec: "10.10.0.0/24", Workers: 1024})
+	m := newWizard("0.3.0", Setup{TargetSpec: "10.10.0.0/24", Workers: 1024, WorkersSet: true})
 	m.w, m.h = w, h
 	m.target.SetValue("10.10.0.0/24")
 	m.setFocus(0)

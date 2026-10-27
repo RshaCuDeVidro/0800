@@ -103,3 +103,56 @@ func TestWizardView(t *testing.T) {
 		}
 	}
 }
+
+func TestPrefsRoundTrip(t *testing.T) {
+	savePrefs(prefs{
+		Target: "192.0.2.0/24", Profile: "quick", Ports: []int{445, 389},
+		Workers: 512, Rate: 100, EnumShares: true,
+	})
+	got := loadPrefs()
+	if got.Target != "192.0.2.0/24" || got.Profile != "quick" || got.Workers != 512 || !got.EnumShares {
+		t.Fatalf("prefs = %+v", got)
+	}
+	if len(got.Ports) != 2 || got.Ports[0] != 445 {
+		t.Errorf("ports = %v", got.Ports)
+	}
+}
+
+func TestWizardPrefillsFromPrefs(t *testing.T) {
+	savePrefs(prefs{
+		Target: "198.51.100.0/30", Profile: "smb", Ports: []int{445},
+		Workers: 256, Rate: 0, EnumShares: true,
+	})
+	m := newWizard("test", Setup{})
+	if m.target.Value() != "198.51.100.0/30" {
+		t.Errorf("target = %q", m.target.Value())
+	}
+	if m.ports.Value() != "445" {
+		t.Errorf("ports = %q", m.ports.Value())
+	}
+	if m.workers.Value() != "256" {
+		t.Errorf("workers = %q", m.workers.Value())
+	}
+	if !m.enum {
+		t.Error("enum should be restored")
+	}
+	// Explicit flags win over saved preferences.
+	m2 := newWizard("test", Setup{TargetSpec: "10.0.0.0/24", Ports: []int{443}, PortsSet: true, Workers: 64, WorkersSet: true})
+	if m2.target.Value() != "10.0.0.0/24" || m2.ports.Value() != "443" || m2.workers.Value() != "64" {
+		t.Errorf("explicit flags ignored: %q %q %q", m2.target.Value(), m2.ports.Value(), m2.workers.Value())
+	}
+}
+
+func TestEstimateHosts(t *testing.T) {
+	cases := map[string]string{
+		"10.0.0.0/24": "≈ 256 hosts",
+		"10.0.0.0/30": "≈ 4 hosts",
+		"192.0.2.1":   "1 host",
+		"":            "",
+	}
+	for in, want := range cases {
+		if got := estimateHosts(in); got != want {
+			t.Errorf("estimate(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

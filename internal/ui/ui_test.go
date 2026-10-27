@@ -12,6 +12,15 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "0800-ui-test")
+	if err == nil {
+		prefsDirOverride = dir
+		defer os.RemoveAll(dir)
+	}
+	os.Exit(m.Run())
+}
+
 func writeFile(p string) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err

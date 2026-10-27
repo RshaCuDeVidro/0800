@@ -27,7 +27,7 @@ import (
 	"golang.org/x/term"
 )
 
-var version = "0.2.0"
+var version = "0.3.0"
 
 type stringList []string
 
@@ -63,6 +63,7 @@ func run() error {
 		profile     = flag.String("profile", "", "port preset: full, quick, ad, smb, db")
 		enumShares  = flag.Bool("enum-shares", true, "enumerate shares during the scan (short list)")
 		menu        = flag.Bool("menu", false, "always show the interactive setup screen")
+		noMenu      = flag.Bool("no-menu", false, "skip the interactive setup screen")
 		noColor     = flag.Bool("no-color", false, "disable ANSI colours")
 		demo        = flag.Bool("demo", false, "run the TUI with built-in example data")
 		width       = flag.Int("width", 0, "override terminal width (demo/screenshots)")
@@ -88,33 +89,45 @@ func run() error {
 		return runDemo(*width, *height)
 	}
 
-	// A profile sets the port list unless -p was given explicitly.
-	pSet := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "p" {
-			pSet = true
-		}
-	})
-	if *profile != "" {
-		pre, ok := preset.Find(*profile)
-		if !ok {
-			return fmt.Errorf("unknown profile %q (want %s)", *profile, strings.Join(preset.Names(), ", "))
-		}
-		if !pSet {
+	setFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+
+	// Resolve the port list from -p / --profile when given; the wizard may
+	// override it later.
+	var flagPorts []int
+	if setFlags["p"] || *profile != "" {
+		if *profile != "" && !setFlags["p"] {
+			pre, ok := preset.Find(*profile)
+			if !ok {
+				return fmt.Errorf("unknown profile %q (want %s)", *profile, strings.Join(preset.Names(), ", "))
+			}
 			*portsFlag = pre.Format()
 		}
+		p, err := preset.ParsePorts(*portsFlag)
+		if err != nil {
+			return err
+		}
+		flagPorts = p
 	}
 
-	if *menu || (len(targets) == 0 && !*demo && !*showVersion) {
-		if !term.IsTerminal(int(os.Stdin.Fd())) {
-			flag.Usage()
-			return errors.New("no targets given (interactive setup needs a terminal)")
+	// The setup screen is the default when a terminal is attached, even if -t
+	// was given (it is prefilled). Scripts use --no-menu or a pipe.
+	interactive := term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
+	showMenu := *menu || (interactive && !*noMenu && !*plain)
+	if showMenu {
+		if !interactive {
+			return errors.New("interactive setup needs a terminal (use --no-menu for scripts)")
 		}
 		setup, err := ui.RunWizard(version, ui.Setup{
 			TargetSpec: strings.Join(targets, ","),
+			Ports:      flagPorts,
+			PortsSet:   setFlags["p"] || *profile != "",
 			Workers:    *concurrency,
+			WorkersSet: setFlags["c"],
 			Rate:       *rate,
+			RateSet:    setFlags["rate"],
 			EnumShares: *enumShares,
+			EnumSet:    setFlags["enum-shares"],
 		})
 		if err != nil {
 			return err
@@ -123,16 +136,23 @@ func run() error {
 			return nil
 		}
 		targets = stringList(setup.Targets)
+		flagPorts = setup.Ports
 		*portsFlag = joinInts(setup.Ports)
 		*concurrency = setup.Workers
 		*rate = setup.Rate
 		*enumShares = setup.EnumShares
 	}
-
-	portList, err := preset.ParsePorts(*portsFlag)
-	if err != nil {
-		return err
+	if len(targets) == 0 {
+		flag.Usage()
+		return errors.New("no targets given")
 	}
+
+	portList := flagPorts
+	if portList == nil {
+		pre, _ := preset.Find(preset.Default)
+		portList = pre.Ports
+	}
+
 	servicePorts, extraPorts, err := parseRemap(*remap)
 	if err != nil {
 		return err
@@ -341,7 +361,7 @@ targets:
       --exclude    CIDR or IP to skip (repeatable)
 
 examples:
-  0800                                # setup menu
+  0800                                # setup menu (default on a terminal)
   0800 -t 10.0.0.0/24 --profile quick
   0800 -t hosts.txt --plain
   0800 -t 192.0.2.10 -p 445,389 --json out.json
