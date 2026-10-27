@@ -244,7 +244,33 @@ func (c *Client) ListShares(ctx context.Context, mode ShareMode) ([]Share, error
 }
 
 // ReadDir lists a directory inside a share. An empty dir means the share root.
+// For the IPC$ namespace it returns named pipes, not files.
 func (c *Client) ReadDir(ctx context.Context, share, dir string) ([]Entry, error) {
+	pipeShare := strings.EqualFold(share, "IPC$")
+
+	entries, err := c.readDir(ctx, share, dir)
+	if !pipeShare {
+		return entries, err
+	}
+	if err == nil && len(entries) > 0 {
+		for i := range entries {
+			entries[i].Pipe = true
+			entries[i].Dir = false
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
+		})
+		return entries, nil
+	}
+	// Not every SMB implementation lets you enumerate the pipe namespace.
+	// Fall back to probing the well-known RPC endpoints.
+	if pipes := c.probePipes(ctx, share); len(pipes) > 0 {
+		return pipes, nil
+	}
+	return entries, err
+}
+
+func (c *Client) readDir(ctx context.Context, share, dir string) ([]Entry, error) {
 	tree, err := c.connectShare(ctx, share)
 	if err != nil {
 		return nil, err
@@ -271,6 +297,48 @@ func (c *Client) ReadDir(ctx context.Context, share, dir string) ([]Entry, error
 		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
 	})
 	return entries, nil
+}
+
+// probePipes opens well-known RPC endpoints to see which are available. This is
+// how Windows and Samba expose the pipe namespace when listing is refused.
+func (c *Client) probePipes(ctx context.Context, share string) []Entry {
+	tree, err := c.connectShare(ctx, share)
+	if err != nil {
+		return nil
+	}
+	defer c.c.treeDisconnect(ctx, tree.id)
+
+	var out []Entry
+	for _, name := range knownPipes {
+		if ctx.Err() != nil {
+			break
+		}
+		id, _, _, err := c.c.create(ctx, tree.id, name, pipeAccess, 0, 7, fileOpen, 0)
+		if err != nil {
+			// Some endpoints only allow attribute access; existence is enough.
+			id, _, _, err = c.c.create(ctx, tree.id, name, fileReadAttributes|synchronize, 0, 7, fileOpen, 0)
+			if err != nil {
+				continue
+			}
+		}
+		c.c.closeFile(ctx, tree.id, id)
+		out = append(out, Entry{Name: name, Pipe: true})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+	})
+	return out
+}
+
+// knownPipes are the RPC endpoints that matter during recon: account, registry,
+// service, print and event-log management, plus the EFS and backup interfaces.
+var knownPipes = []string{
+	"samr", "lsarpc", "lsass", "netlogon", "srvsvc", "wkssvc", "winreg",
+	"svcctl", "spoolss", "eventlog", "ntsvcs", "atsvc", "browser", "epmapper",
+	"router", "netdfs", "trkwks", "efsrpc", "FssagentRpc", "mdssvc", "keysvc",
+	"initshutdown", "scerpc", "SensApi", "cert", "dscers", "llssrv", "locator",
+	"nrpc", "pchsvc", "profmap", "regsec", "RemoteIPC", "sql\\query",
+	"SQLLEN\\query", "MsFteWds", "SMSERVER", "TSVNC", "Winsock2",
 }
 
 // Open starts streaming a remote file.

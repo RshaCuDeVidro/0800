@@ -30,6 +30,7 @@ const (
 type remoteEntry struct {
 	Name    string
 	Dir     bool
+	Pipe    bool
 	Size    int64
 	ModTime time.Time
 	up      bool
@@ -311,10 +312,6 @@ func (b *browser) open() tea.Cmd {
 			return nil
 		}
 		item := b.shares[b.cursor]
-		if item.Type == "pipe" {
-			b.err = item.Name + " is a named pipe, not a browsable share"
-			return nil
-		}
 		b.loading = true
 		b.err = ""
 		return b.connectCmd(item)
@@ -536,15 +533,21 @@ func (b *browser) rowLine(i int, selected bool, width int) string {
 	e := b.entries[i]
 	icon := "·"
 	name := e.Name
-	if e.up {
+	switch {
+	case e.up:
 		icon = "↑"
-	} else if e.Dir {
+	case e.Pipe:
+		icon = "│"
+	case e.Dir:
 		icon = "▸"
 		name += "/"
 	}
 	left := fmt.Sprintf("%s %s", icon, name)
 	size := ""
-	if !e.Dir {
+	switch {
+	case e.Pipe:
+		size = "pipe"
+	case !e.Dir:
 		size = humanSize(e.Size)
 	}
 	if e.ModTime.IsZero() || width < 46 {
@@ -555,7 +558,9 @@ func (b *browser) rowLine(i int, selected bool, width int) string {
 		return b.highlight(line, selected, width)
 	}
 	line := spread(left, styleDim.Render(size), width)
-	if e.Dir {
+	if e.Pipe {
+		line = spread(styleDim.Render(left), styleFaint.Render(size), width)
+	} else if e.Dir {
 		line = spread(styleBlue.Render(left), styleDim.Render(size), width)
 	}
 	return b.highlight(line, selected, width)
@@ -613,7 +618,7 @@ func (s *smbFS) List(ctx context.Context, path string) ([]remoteEntry, error) {
 	}
 	out := make([]remoteEntry, 0, len(es))
 	for _, e := range es {
-		out = append(out, remoteEntry{Name: e.Name, Dir: e.Dir, Size: e.Size, ModTime: e.ModTime})
+		out = append(out, remoteEntry{Name: e.Name, Dir: e.Dir, Pipe: e.Pipe, Size: e.Size, ModTime: e.ModTime})
 	}
 	return out, nil
 }

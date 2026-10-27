@@ -32,6 +32,7 @@ type Entry struct {
 	Name    string
 	Size    int64
 	Dir     bool
+	Pipe    bool
 	Mode    uint32
 	ModTime time.Time
 }
