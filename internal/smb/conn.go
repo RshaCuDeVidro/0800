@@ -66,7 +66,7 @@ type Config struct {
 func DefaultConfig() Config {
 	var guid [16]byte
 	_, _ = rand.Read(guid[:])
-	return Config{Port: 445, DialTimeout: 3 * time.Second, IOTimeout: 6 * time.Second, EnumTimeout: 4 * time.Second, ClientGUID: guid}
+	return Config{Port: 445, DialTimeout: 3 * time.Second, IOTimeout: 6 * time.Second, EnumTimeout: 4 * time.Second, ShareMode: SharesQuick, ClientGUID: guid}
 }
 
 type header struct {
