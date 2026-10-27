@@ -1,0 +1,315 @@
+package scan
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/rsha/0800/internal/db"
+	"github.com/rsha/0800/internal/ldap"
+	"github.com/rsha/0800/internal/nfs"
+	"github.com/rsha/0800/internal/smb"
+)
+
+// dispatch routes an open port to the matching protocol prober.
+func (e *Engine) dispatch(ctx context.Context, ip string, port int) {
+	switch port {
+	case 445:
+		e.probeSMB(ctx, ip)
+	case 389:
+		e.probeLDAP(ctx, ip)
+	case 2049:
+		e.probeNFS(ctx, ip)
+	case 3306, 5432, 6379:
+		e.probeDB(ctx, ip, port)
+	case 88:
+		e.probeKerberos(ctx, ip)
+	default:
+		e.banner(ctx, ip, port)
+	}
+}
+
+func (e *Engine) probeSMB(ctx context.Context, ip string) {
+	cfg := smb.DefaultConfig()
+	cfg.DialTimeout = e.cfg.DialTimeout
+	cfg.IOTimeout = e.cfg.IOTimeout
+
+	p, err := smb.ProbeHost(ctx, ip, cfg)
+	if err != nil {
+		e.store.SetService(ip, ServiceView{Port: 445, Proto: "smb", Banner: err.Error()})
+		return
+	}
+
+	view := &SMBView{
+		Dialect: p.Dialect,
+		Signing: p.Signing,
+		SMB1:    p.SMB1,
+		Host:    p.Identity.DNSName,
+		Domain:  p.Identity.DNSDomain,
+		NetBIOS: p.Identity.NetBIOSName,
+		OS:      p.Identity.OSVersion,
+		EnumErr: p.EnumErr,
+	}
+	if view.Host == "" {
+		view.Host = p.Identity.NetBIOSName
+	}
+	if view.Domain == "" {
+		view.Domain = p.Identity.NetBIOSDom
+	}
+	for _, a := range p.Auth {
+		if !a.OK {
+			continue
+		}
+		view.Auth = a.Kind
+		if a.Guest {
+			view.Auth = "guest"
+		}
+	}
+	for _, s := range p.Shares {
+		view.Shares = append(view.Shares, ShareView{
+			Name: s.Name, Type: s.Type, Comment: s.Comment, Writable: s.Writable,
+		})
+	}
+	if len(p.Notes) > 0 && strings.Contains(strings.Join(p.Notes, " "), "NTLM") {
+		view.NTLMOff = true
+	}
+	e.store.SetSMB(ip, view)
+
+	var evidence []string
+	for _, a := range p.Auth {
+		if a.OK {
+			evidence = append(evidence, fmt.Sprintf("SESSION_SETUP %s -> SUCCESS (guest=%t null=%t)", a.Kind, a.Guest, a.Null))
+		} else {
+			evidence = append(evidence, fmt.Sprintf("SESSION_SETUP %s -> %s", a.Kind, a.Status))
+		}
+	}
+
+	base := fmt.Sprintf("dialect %s · signing %s", p.Dialect, p.Signing)
+	switch view.Auth {
+	case "null":
+		e.store.AddFinding(ip, Finding{
+			Port: 445, Proto: "smb", Kind: "smb-null", Label: "null session",
+			Severity: SevCritical, Detail: "anonymous SMB session accepted · " + base,
+			Evidence: evidence,
+		})
+	case "guest":
+		e.store.AddFinding(ip, Finding{
+			Port: 445, Proto: "smb", Kind: "smb-guest", Label: "guest login",
+			Severity: SevHigh, Detail: "guest account accepted with empty password · " + base,
+			Evidence: evidence,
+		})
+	}
+
+	if p.Signing == "disabled" {
+		e.store.AddFinding(ip, Finding{
+			Port: 445, Proto: "smb", Kind: "smb-signing", Label: "signing off",
+			Severity: SevLow, Detail: "SMB signing disabled (relay surface)",
+		})
+	}
+	if p.SMB1 {
+		e.store.AddFinding(ip, Finding{
+			Port: 445, Proto: "smb", Kind: "smb1", Label: "smb1",
+			Severity: SevLow, Detail: "SMB1 dialect accepted (" + p.SMB1Signing + " signing)",
+		})
+	}
+	if len(view.Shares) > 0 {
+		names := make([]string, 0, len(view.Shares))
+		sev := SevHigh
+		var writable []string
+		for _, s := range view.Shares {
+			names = append(names, s.Name)
+			if s.Writable && s.Type == "disk" {
+				writable = append(writable, s.Name)
+				sev = SevCritical
+			}
+		}
+		sort.Strings(names)
+		e.store.AddFinding(ip, Finding{
+			Port: 445, Proto: "smb", Kind: "smb-shares", Label: "shares",
+			Severity: sev,
+			Detail:   fmt.Sprintf("%d share(s): %s", len(names), strings.Join(names, ", ")),
+			Evidence: append(evidence, fmt.Sprintf("NetrShareEnum -> %d shares", len(names))),
+		})
+		if len(writable) > 0 {
+			e.store.AddFinding(ip, Finding{
+				Port: 445, Proto: "smb", Kind: "smb-write", Label: "write access",
+				Severity: SevCritical,
+				Detail:   "writable share(s) as unauthenticated user: " + strings.Join(writable, ", "),
+			})
+		}
+	} else if p.EnumErr != "" {
+		e.store.AddFinding(ip, Finding{
+			Port: 445, Proto: "smb", Kind: "smb-enum", Label: "enum denied",
+			Severity: SevInfo, Detail: "share enumeration failed: " + p.EnumErr,
+			Evidence: evidence,
+		})
+	}
+
+	if p.Identity.DNSDomain != "" || p.Identity.NetBIOSDom != "" {
+		e.store.SetService(ip, ServiceView{
+			Port: 445, Proto: "smb",
+			Banner: strings.TrimSpace(p.Identity.DNSName + " " + p.Identity.DNSDomain),
+			KV: [][2]string{
+				{"netbios", p.Identity.NetBIOSName},
+				{"domain", p.Identity.NetBIOSDom},
+				{"dns", p.Identity.DNSName},
+				{"dns domain", p.Identity.DNSDomain},
+				{"dialect", p.Dialect},
+			},
+		})
+	}
+}
+
+func (e *Engine) probeLDAP(ctx context.Context, ip string) {
+	addr := net.JoinHostPort(ip, "389")
+	res, err := ldap.Probe(ctx, addr, e.cfg.IOTimeout)
+	if err != nil {
+		e.store.SetService(ip, ServiceView{Port: 389, Proto: "ldap", Banner: err.Error()})
+		return
+	}
+	view := &LDAPView{
+		Bound:     res.Bound,
+		Code:      res.BindCode,
+		Message:   res.BindMessage,
+		Entries:   res.Entries,
+		Sample:    res.Sample,
+		DefaultDN: res.DefaultDN,
+		DNSHost:   res.Host,
+		Vendor:    res.Vendor,
+		Version:   res.Version,
+		IsDC:      res.IsDC,
+	}
+	e.store.SetLDAP(ip, view)
+
+	kv := [][2]string{{"bind", strconv.Itoa(res.BindCode) + " " + res.BindMessage}}
+	if res.DefaultDN != "" {
+		kv = append(kv, [2]string{"base DN", res.DefaultDN})
+	}
+	if res.Host != "" {
+		kv = append(kv, [2]string{"dns host", res.Host})
+	}
+	if res.Vendor != "" {
+		kv = append(kv, [2]string{"vendor", strings.TrimSpace(res.Vendor + " " + res.Version)})
+	}
+	e.store.SetService(ip, ServiceView{Port: 389, Proto: "ldap", Banner: res.DefaultDN, KV: kv})
+
+	if res.Entries > 0 {
+		e.store.AddFinding(ip, Finding{
+			Port: 389, Proto: "ldap", Kind: "ldap-anon", Label: "anon search",
+			Severity: SevHigh,
+			Detail: fmt.Sprintf("anonymous bind returned %d object(s) from %s",
+				res.Entries, res.DefaultDN),
+			Evidence: []string{
+				fmt.Sprintf("bind(anonym) -> %d", res.BindCode),
+				fmt.Sprintf("search(%s, onelevel, sizeLimit=5) -> %d entries", res.DefaultDN, res.Entries),
+			},
+		})
+	} else if res.Bound {
+		e.store.AddFinding(ip, Finding{
+			Port: 389, Proto: "ldap", Kind: "ldap-bind", Label: "anon bind",
+			Severity: SevLow, Detail: "anonymous bind accepted, no objects readable",
+		})
+	}
+}
+
+func (e *Engine) probeNFS(ctx context.Context, ip string) {
+	res, err := nfs.Probe(ctx, ip, nfs.Config{Timeout: e.cfg.IOTimeout})
+	if err != nil {
+		e.store.SetService(ip, ServiceView{Port: 2049, Proto: "nfs", Banner: err.Error()})
+		return
+	}
+	view := &NFSView{Version: res.Version, Note: res.Note, Port: res.Port, MountPort: res.MountPort}
+	var mounted, listed []string
+	for _, ex := range res.Exports {
+		view.Exports = append(view.Exports, ExportView{
+			Path: ex.Path, Groups: ex.Groups, Mounted: ex.Mounted,
+		})
+		listed = append(listed, ex.Path)
+		if ex.Mounted {
+			mounted = append(mounted, fmt.Sprintf("%s (%d entries)", ex.Path, ex.Entries))
+		}
+	}
+	e.store.SetNFS(ip, view)
+
+	if len(view.Exports) == 0 {
+		return
+	}
+	sev := SevMedium
+	if len(mounted) > 0 {
+		sev = SevHigh
+	}
+	e.store.AddFinding(ip, Finding{
+		Port: 2049, Proto: "nfs", Kind: "nfs-export", Label: "exports",
+		Severity: sev,
+		Detail:   strings.Join(listed, ", "),
+		Evidence: []string{
+			fmt.Sprintf("MOUNTPROC_EXPORT -> %d export(s)", len(view.Exports)),
+			fmt.Sprintf("MOUNTPROC_MNT -> %d mounted", len(mounted)),
+		},
+	})
+	if len(mounted) > 0 {
+		e.store.AddFinding(ip, Finding{
+			Port: 2049, Proto: "nfs", Kind: "nfs-read", Label: "nfs read",
+			Severity: SevHigh, Detail: "readable without credentials: " + strings.Join(mounted, ", "),
+		})
+	}
+}
+
+func (e *Engine) probeKerberos(ctx context.Context, ip string) {
+	e.store.SetService(ip, ServiceView{
+		Port: 88, Proto: "kerberos", Banner: "KDC",
+	})
+	e.store.AddFinding(ip, Finding{
+		Port: 88, Proto: "kerberos", Kind: "kdc", Label: "kdc",
+		Severity: SevInfo, Detail: "Kerberos KDC reachable",
+	})
+}
+
+func (e *Engine) probeDB(ctx context.Context, ip string, port int) {
+	res := db.Probe(ctx, ip, port, e.cfg.IOTimeout)
+	view := DBView{
+		Port: port, Proto: res.Proto, Version: res.Version,
+		User: res.User, Status: res.Status, Detail: res.Detail,
+	}
+	e.store.AddDB(ip, view)
+	e.store.SetService(ip, ServiceView{Port: port, Proto: res.Proto, Banner: res.Version})
+
+	if res.Status == "open" {
+		e.store.AddFinding(ip, Finding{
+			Port: port, Proto: res.Proto, Kind: res.Proto + "-open", Label: res.Proto + " open",
+			Severity: SevCritical,
+			Detail:   fmt.Sprintf("%s accepted user %q with an empty password", res.Proto, res.User),
+			Evidence: res.Detail,
+		})
+	}
+}
+
+func (e *Engine) banner(ctx context.Context, ip string, port int) {
+	d := net.Dialer{Timeout: e.cfg.DialTimeout}
+	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(600 * time.Millisecond))
+	buf := make([]byte, 256)
+	n, _ := conn.Read(buf)
+	if n <= 0 {
+		return
+	}
+	banner := strings.TrimSpace(string(buf[:n]))
+	banner = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, banner)
+	if len(banner) > 80 {
+		banner = banner[:80]
+	}
+	e.store.SetService(ip, ServiceView{Port: port, Proto: "tcp", Banner: banner})
+}
