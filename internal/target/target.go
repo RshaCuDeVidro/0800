@@ -257,10 +257,19 @@ func lessIP(a, b string) bool {
 }
 
 func isFile(path string) bool {
-	if strings.ContainsAny(path, "/\\") && !strings.Contains(path, ":") {
-		if st, err := os.Stat(path); err == nil && !st.IsDir() {
-			return true
-		}
+	if path == "" {
+		return false
 	}
-	return false
+	// Addresses are not paths, even when they contain a separator or a colon.
+	if net.ParseIP(path) != nil {
+		return false
+	}
+	if _, _, err := net.ParseCIDR(path); err == nil {
+		return false
+	}
+	if strings.Contains(path, ":") && !strings.ContainsAny(path, `\/`) {
+		return false // host:port
+	}
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
 }

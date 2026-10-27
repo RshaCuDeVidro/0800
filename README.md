@@ -160,7 +160,7 @@ $ 0800 -t 192.0.2.0/24 -p 445,389 --plain
 ```json
 {
   "tool": "0800",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "started": "2026-10-27T12:00:00Z",
   "stats": { "targets": 4, "scanned": 4, "openPorts": 6, "findings": 4, "exposedHosts": 3 },
   "hosts": [

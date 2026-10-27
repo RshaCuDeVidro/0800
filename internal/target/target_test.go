@@ -110,3 +110,31 @@ func TestSplitSpecsKeepsPaths(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func TestParseBareFilename(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "targets.txt"), []byte("192.0.2.9\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(old)
+
+	got, err := Parse([]string{"targets.txt"}, Options{})
+	if err != nil {
+		t.Fatalf("bare filename: %v", err)
+	}
+	if len(got) != 1 || got[0] != "192.0.2.9" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestIsFileRejectsAddresses(t *testing.T) {
+	for _, s := range []string{"192.0.2.1", "192.0.2.0/24", "host:445", "2001:db8::1"} {
+		if isFile(s) {
+			t.Errorf("isFile(%q) must be false", s)
+		}
+	}
+}
