@@ -31,6 +31,14 @@ Everything is **read-only**: no uploads, no writes, no deletes, no password spra
 **two** authentication attempts are made per host (null, then guest) so account lockout policies
 are not tripped.
 
+## Setup
+
+Running `0800` with no arguments opens an interactive setup screen: target, profile, ports,
+workers and whether to enumerate shares during the scan. Everything is also available as flags,
+so scripts never see the menu.
+
+![setup](docs/screenshots/setup.svg)
+
 ## Screenshots
 
 | Exposure summary (`s`) | Remote file browser + findings |
@@ -85,9 +93,12 @@ flags:
   -p                   comma separated ports (default 445,88,389,2049,3306,5432,6379)
       --timeout        TCP dial timeout (default 700ms)
       --io-timeout     per protocol timeout (default 6s)
-  -c                   parallel TCP workers (default 512)
-      --probe-workers  parallel protocol workers (default 24)
+      --profile        port preset: full, quick, ad, smb, db
+  -c                   parallel TCP workers (default 1024)
+      --probe-workers  parallel protocol workers (default 64)
       --rate           max dials/second (0 = unlimited)
+      --enum-shares    probe common share names during the scan (short list)
+      --menu           always show the interactive setup screen
       --max-hosts      refuse to expand beyond this many targets (default 65536)
       --loot           download directory (default 0800-loot)
       --flat           download straight into the loot root
@@ -108,6 +119,9 @@ flags:
 | `g` | **get** the selected file |
 | `tab` | details pane (findings + evidence) |
 | `s` | exposure summary (severity, top hosts, services) |
+| `e` | export `0800-report.json` + `0800-report.md` |
+| `o` | cycle sort: ip / severity / findings |
+| `x` | stop the running scan (results stay on screen) |
 | `/` | filter hosts by IP, name or tag |
 | `a` | show every target, including silent ones |
 | `r` | reload the current directory |
@@ -142,7 +156,7 @@ $ 0800 -t 192.0.2.0/24 -p 445,389 --plain
 ```json
 {
   "tool": "0800",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "started": "2026-10-27T12:00:00Z",
   "stats": { "targets": 4, "scanned": 4, "openPorts": 6, "findings": 4, "exposedHosts": 3 },
   "hosts": [
@@ -294,7 +308,14 @@ go test -tags integration ./internal/integration -v
 
 ## Performance and etiquette
 
-- Defaults are conservative: 512 dials in flight, 700 ms connect timeout, 6 s protocol timeout.
+- 1024 TCP workers and 64 protocol workers by default; both are flags.
+- Two-stage pipeline: a TCP sweep, then protocol probes only on ports that answered.
+- Share enumeration is tiered: the scan asks `srvsvc` and, if that is blocked, only probes the
+  14 most common share names (bounded to 3 s). The full list is loaded when you open the host,
+  so a scan never pays 45 round trips per host. `--enum-shares=false` skips it entirely.
+- A per-host budget (15 s) stops slow servers from pinning a worker.
+- The UI reads immutable snapshots and rebuilds the visible list only when it changed; a 65k-host
+  store refreshes in ~130 ns when nothing moved (see `BenchmarkRefreshBigList`).
 - `--rate` caps dials per second globally; use it on monitored networks.
 - A target list larger than `--max-hosts` is refused, and CIDRs larger than a `/8` are rejected
   before expansion.

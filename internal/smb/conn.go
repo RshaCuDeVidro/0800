@@ -38,19 +38,35 @@ const (
 	dialect302  uint16 = 0x0302
 )
 
+// ShareMode selects how hard to look for shares when srvsvc is blocked.
+type ShareMode int
+
+const (
+	// SharesOff only asks srvsvc (fastest).
+	SharesOff ShareMode = iota
+	// SharesQuick probes the 14 most common names (scan default).
+	SharesQuick
+	// SharesFull probes the whole list (used when opening a host).
+	SharesFull
+)
+
 // Config controls timeouts and identification.
 type Config struct {
 	Port        int
 	DialTimeout time.Duration
 	IOTimeout   time.Duration
 	ClientGUID  [16]byte
+	// ShareMode controls the common-name fallback when srvsvc is blocked.
+	ShareMode ShareMode
+	// EnumTimeout caps share enumeration during a scan.
+	EnumTimeout time.Duration
 }
 
 // DefaultConfig returns sane defaults for internet scale probing.
 func DefaultConfig() Config {
 	var guid [16]byte
 	_, _ = rand.Read(guid[:])
-	return Config{Port: 445, DialTimeout: 3 * time.Second, IOTimeout: 6 * time.Second, ClientGUID: guid}
+	return Config{Port: 445, DialTimeout: 3 * time.Second, IOTimeout: 6 * time.Second, EnumTimeout: 4 * time.Second, ClientGUID: guid}
 }
 
 type header struct {

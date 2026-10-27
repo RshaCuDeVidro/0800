@@ -19,6 +19,10 @@ type Config struct {
 	Concurrency  int
 	ProbeWorkers int
 	Rate         int // dials per second, 0 = unlimited
+	HostBudget   time.Duration
+	// EnumShares runs share enumeration (srvsvc) during the scan. The browser
+	// can always enumerate on demand.
+	EnumShares bool
 	// ServicePorts maps a non-standard port to a protocol name ("smb", "ldap",
 	// "nfs", "mysql", "postgres", "redis", "kerberos"). Useful for labs and NAT.
 	ServicePorts map[int]string
@@ -61,16 +65,19 @@ type probeJob struct {
 // New creates an engine. Targets must already be expanded and sorted.
 func New(cfg Config) *Engine {
 	if cfg.DialTimeout <= 0 {
-		cfg.DialTimeout = 700 * time.Millisecond
+		cfg.DialTimeout = 500 * time.Millisecond
 	}
 	if cfg.IOTimeout <= 0 {
-		cfg.IOTimeout = 5 * time.Second
+		cfg.IOTimeout = 4 * time.Second
+	}
+	if cfg.HostBudget <= 0 {
+		cfg.HostBudget = 15 * time.Second
 	}
 	if cfg.Concurrency <= 0 {
-		cfg.Concurrency = 512
+		cfg.Concurrency = 1024
 	}
 	if cfg.ProbeWorkers <= 0 {
-		cfg.ProbeWorkers = 24
+		cfg.ProbeWorkers = 64
 	}
 	if len(cfg.Ports) == 0 {
 		cfg.Ports = DefaultPorts
@@ -202,7 +209,11 @@ func (e *Engine) runProbe(ctx context.Context, pj probeJob) {
 		}
 	}()
 
-	pctx, cancel := context.WithTimeout(ctx, e.cfg.IOTimeout*3)
+	budget := e.cfg.IOTimeout * 3
+	if e.cfg.HostBudget > 0 && e.cfg.HostBudget < budget {
+		budget = e.cfg.HostBudget
+	}
+	pctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
 	if e.cfg.Probe != nil {

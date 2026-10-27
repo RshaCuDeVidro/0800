@@ -77,6 +77,8 @@ type browser struct {
 	export    string
 	info      []string
 	scroll    int
+
+	shareCache map[string][]shareItem
 }
 
 type connectedMsg struct {
@@ -95,11 +97,18 @@ type listedMsg struct {
 	err     error
 }
 
+type sharesMsg struct {
+	ip     string
+	shares []shareItem
+	err    error
+}
+
 func (b *browser) reset() {
 	if b.fs != nil {
 		go b.fs.Close()
 	}
-	*b = browser{smbCfg: b.smbCfg, nfsTimeout: b.nfsTimeout}
+	cache := b.shareCache
+	*b = browser{smbCfg: b.smbCfg, nfsTimeout: b.nfsTimeout, shareCache: cache}
 }
 
 // openHost picks the most useful panel for the selected host.
@@ -112,20 +121,25 @@ func (b *browser) openHost(h *scan.HostView) tea.Cmd {
 	}
 
 	switch {
-	case h.SMB != nil && h.SMB.Auth != "" && h.SMB.Signing != "required" && len(h.SMB.Shares) > 0:
+	case h.SMB != nil && h.SMB.Auth != "" && h.SMB.Signing != "required":
 		b.mode = modeShares
 		b.proto = "smb"
 		b.auth = h.SMB.Auth
 		b.smbPort = h.SMB.Port
-		b.shares = nil
-		for _, s := range h.SMB.Shares {
-			b.shares = append(b.shares, shareItem{
-				Name: s.Name, Type: s.Type, Comment: s.Comment, Writable: s.Writable,
-			})
+		if cached, ok := b.shareCache[h.IP]; ok {
+			b.shares = cached
+		} else if len(h.SMB.Shares) > 0 {
+			for _, s := range h.SMB.Shares {
+				b.shares = append(b.shares, shareItem{
+					Name: s.Name, Type: s.Type, Comment: s.Comment, Writable: s.Writable,
+				})
+			}
+			sortShares(b.shares)
+		} else {
+			// The scan skipped enumeration to stay fast; load it on demand.
+			b.loading = true
+			return b.loadSharesCmd()
 		}
-		sort.Slice(b.shares, func(i, j int) bool {
-			return strings.ToLower(b.shares[i].Name) < strings.ToLower(b.shares[j].Name)
-		})
 	case h.NFS != nil && len(h.NFS.Exports) > 0:
 		b.mode = modeShares
 		b.proto = "nfs"
@@ -171,6 +185,53 @@ func (b *browser) rows() int {
 		return len(b.entries)
 	}
 	return 0
+}
+
+func sortShares(list []shareItem) {
+	sort.Slice(list, func(i, j int) bool {
+		return strings.ToLower(list[i].Name) < strings.ToLower(list[j].Name)
+	})
+}
+
+// loadSharesCmd enumerates shares on demand, including the common-name
+// fallback that is too slow for the scan phase.
+func (b *browser) loadSharesCmd() tea.Cmd {
+	ip, auth, port := b.hostIP, b.auth, b.smbPort
+	cfg := b.smbCfg
+	cfg.Port = port
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		c, err := smb.Connect(ctx, ip, auth, cfg)
+		if err != nil {
+			return sharesMsg{ip: ip, err: err}
+		}
+		defer c.Close()
+		shares, err := c.ListShares(ctx, smb.SharesFull)
+		if err != nil {
+			return sharesMsg{ip: ip, err: err}
+		}
+		out := make([]shareItem, 0, len(shares))
+		for _, s := range shares {
+			out = append(out, shareItem{Name: s.Name, Type: s.Type, Comment: s.Comment, Writable: s.Writable})
+		}
+		sortShares(out)
+		return sharesMsg{ip: ip, shares: out}
+	}
+}
+
+func (b *browser) applyShares(msg sharesMsg) {
+	b.loading = false
+	if msg.err != nil {
+		b.err = msg.err.Error()
+		return
+	}
+	b.shares = msg.shares
+	if b.shareCache == nil {
+		b.shareCache = map[string][]shareItem{}
+	}
+	b.shareCache[msg.ip] = msg.shares
+	b.err = ""
 }
 
 func (b *browser) connectCmd(item shareItem) tea.Cmd {

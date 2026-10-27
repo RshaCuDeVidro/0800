@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -276,5 +277,22 @@ func TestViewFitsEverySize(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func BenchmarkRefreshBigList(b *testing.B) {
+	hosts := make([]string, 0, 65000)
+	for i := 0; i < 65000; i++ {
+		hosts = append(hosts, fmt.Sprintf("10.%d.%d.%d", i/65536, (i/256)%256, i%256))
+	}
+	st := scan.NewStore(hosts, nil)
+	for _, ip := range hosts {
+		st.PortOpen(ip, 445)
+	}
+	st.Refresh()
+	m := New(Config{Store: st, Width: 120, Height: 40})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.refresh()
 	}
 }
