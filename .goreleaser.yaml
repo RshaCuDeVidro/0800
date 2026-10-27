@@ -26,7 +26,14 @@ builds:
       - -s -w -X main.version={{.Version}}
 
 archives:
-  - id: default
+  # Ready-to-run binaries: download the one file for your OS/arch from the
+  # release page and execute it directly — no unpacking.
+  - id: binary
+    formats: [binary]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Os }}_{{ .Arch }}
+  # Compressed archives bundle the LICENSE and README for packagers/distros.
+  - id: archive
     formats: [tar.gz]
     name_template: >-
       {{ .ProjectName }}_{{ .Os }}_{{ .Arch }}
@@ -56,6 +63,6 @@ release:
   draft: false
   prerelease: auto
   footer: |
-    **Full changelog**: https://github.com/rsha/0800/compare/{{ .PreviousTag }}...{{ .Tag }}
+    **Full changelog**: https://github.com/RshaCuDeVidro/0800/compare/{{ .PreviousTag }}...{{ .Tag }}
 
     Only use 0800 against systems you own or have written permission to test.
