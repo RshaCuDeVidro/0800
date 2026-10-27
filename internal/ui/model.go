@@ -93,6 +93,7 @@ type downloadedMsg struct {
 type exportedMsg struct {
 	json string
 	md   string
+	html string
 	err  error
 }
 
@@ -203,7 +204,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.toast("export failed: "+msg.err.Error(), scan.SevHigh)
 		} else {
-			m.toast("report saved: "+msg.json+" · "+msg.md, scan.SevInfo)
+			m.toast("report saved: "+msg.json+" · "+msg.md+" · "+msg.html, scan.SevInfo)
 		}
 		return m, nil
 
@@ -362,7 +363,17 @@ func (m *Model) keyRemote(msg tea.KeyMsg) tea.Cmd {
 			m.detailsOff = 1 << 20
 		case matches(msg, keys.Back), msg.String() == "left":
 			m.showDetails = false
-			m.focus = 0
+			// Closing the details overlay returns to whatever was underneath
+			// it. If that's an active browser session (shares, a directory,
+			// a DB/FTP info panel), stay on it: dropping focus to the host
+			// list here used to mean the *next* "enter" called openHost(),
+			// which unconditionally resets the browser and so silently
+			// closed the session and discarded the directory position. Only
+			// a host with nothing to browse (modeEmpty) has no "underneath"
+			// to return to, so that one case still goes back to the list.
+			if m.browser.mode == modeEmpty {
+				m.focus = 0
+			}
 		}
 		return nil
 	}
@@ -981,7 +992,7 @@ func (m *Model) helpView(h int) string {
 		{"/", "filter targets"},
 	}
 	act := [][2]string{
-		{"e", "export json + markdown"},
+		{"e", "export json + markdown + html"},
 		{"o", "sort: ip / sev / hits"},
 		{"x", "stop the scan"},
 		{"a", "show silent targets"},
@@ -1011,14 +1022,14 @@ func (m *Model) helpView(h int) string {
 		styleText.Render("0800 finds services that answer without credentials.") + "\n" +
 		styleDim.Render("SMB null/guest · LDAP anonymous bind · NFS exports · open databases") + "\n\n" +
 		styleWarn.Render("Use only against systems you are authorised to test.") + "\n" +
-		styleFaint.Render("downloads: "+m.cfg.LootDir+"  ·  reports: ./0800-report.{json,md}")
+		styleFaint.Render("downloads: "+m.cfg.LootDir+"  ·  reports: ./0800-report.{json,md,html}")
 
 	height := min(h, lipgloss.Height(body)+5)
 	box := panel("help", "esc closes", body, w, height, true)
 	return lipgloss.Place(m.w, h, lipgloss.Center, lipgloss.Center, box)
 }
 
-// export writes a JSON and a Markdown report next to the working directory.
+// export writes a JSON, Markdown and HTML report next to the working directory.
 func (m *Model) export() tea.Cmd {
 	snap := m.snap
 	ver := m.cfg.Version
@@ -1033,7 +1044,10 @@ func (m *Model) export() tea.Cmd {
 		if err := report.WriteMarkdown("0800-report.md", doc); err != nil {
 			return exportedMsg{err: err}
 		}
-		return exportedMsg{json: "0800-report.json", md: "0800-report.md"}
+		if err := report.WriteHTML("0800-report.html", doc); err != nil {
+			return exportedMsg{err: err}
+		}
+		return exportedMsg{json: "0800-report.json", md: "0800-report.md", html: "0800-report.html"}
 	}
 }
 
@@ -1130,12 +1144,18 @@ func (m *Model) destPath(name string) string {
 	parts = append(parts, sanitizeName(name))
 
 	dest := filepath.Join(parts...)
-	base, ext := dest, ""
-	if i := strings.LastIndex(dest, "."); i > 0 {
-		base, ext = dest[:i], dest[i:]
+	// The extension must come from the filename alone: splitting on the last
+	// dot in the whole path broke on a host IP (its own dots are earlier in
+	// the string than a filename with no extension of its own) and inserted
+	// the "(1)" collision suffix in the middle of the IP address instead of
+	// after the filename.
+	dir, file := filepath.Split(dest)
+	base, ext := file, ""
+	if i := strings.LastIndex(file, "."); i > 0 {
+		base, ext = file[:i], file[i:]
 	}
 	for i := 1; exists(dest); i++ {
-		dest = fmt.Sprintf("%s (%d)%s", base, i, ext)
+		dest = filepath.Join(dir, fmt.Sprintf("%s (%d)%s", base, i, ext))
 		if i > 500 {
 			break
 		}

@@ -19,8 +19,8 @@ type Preset struct {
 var All = []Preset{
 	{
 		Name:  "full",
-		Desc:  "SMB, LDAP, NFS and databases",
-		Ports: []int{445, 88, 389, 2049, 3306, 5432, 6379},
+		Desc:  "SMB, LDAP, NFS, FTP and databases",
+		Ports: []int{21, 445, 88, 389, 2049, 3306, 5432, 6379},
 	},
 	{
 		Name:  "quick",

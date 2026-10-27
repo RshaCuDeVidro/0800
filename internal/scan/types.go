@@ -126,6 +126,15 @@ type NFSView struct {
 	Note      string       `json:"note,omitempty"`
 }
 
+// FTPView is the result of the anonymous FTP probe.
+type FTPView struct {
+	Port    int    `json:"port,omitempty"`
+	Banner  string `json:"banner,omitempty"`
+	AnonOK  bool   `json:"anonOK"`
+	Code    int    `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
 // DBView describes an exposed database service.
 type DBView struct {
 	Port    int      `json:"port"`
@@ -165,6 +174,7 @@ type HostView struct {
 	SMB      *SMBView      `json:"smb,omitempty"`
 	NFS      *NFSView      `json:"nfs,omitempty"`
 	LDAP     *LDAPView     `json:"ldap,omitempty"`
+	FTP      *FTPView      `json:"ftp,omitempty"`
 	DBs      []DBView      `json:"databases,omitempty"`
 	DC       bool          `json:"domainController,omitempty"`
 	Err      string        `json:"error,omitempty"`

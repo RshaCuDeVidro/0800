@@ -103,6 +103,20 @@ func detailsLines(h *scan.HostView, width int) []string {
 		add("")
 	}
 
+	if h.FTP != nil {
+		add(styleAccent.Render("ftp"))
+		add(kv("banner", h.FTP.Banner))
+		state := "closed"
+		c := styleDim
+		if h.FTP.AnonOK {
+			state, c = "anonymous login accepted", styleCrit
+		} else if h.FTP.Message != "" {
+			state = fmt.Sprintf("%d %s", h.FTP.Code, h.FTP.Message)
+		}
+		add(styleDim.Render(fmt.Sprintf("%-10s", "login")) + c.Render(state))
+		add("")
+	}
+
 	for _, d := range h.DBs {
 		add(styleAccent.Render(d.Proto))
 		add(kv("port", fmt.Sprint(d.Port)))

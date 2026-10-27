@@ -30,7 +30,7 @@ func TestWizardStart(t *testing.T) {
 	if m.setup == nil || len(m.setup.Targets) != 4 {
 		t.Fatalf("setup = %+v", m.setup)
 	}
-	if len(m.setup.Ports) != 7 || m.setup.Workers != 1024 {
+	if len(m.setup.Ports) != 8 || m.setup.Workers != 1024 {
 		t.Errorf("setup = %+v", m.setup)
 	}
 	if m.setup.Targets[0] != "192.0.2.0" || m.setup.Targets[3] != "192.0.2.3" {

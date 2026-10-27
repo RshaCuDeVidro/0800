@@ -7,7 +7,6 @@ import (
 	"io"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -53,6 +52,9 @@ func ProbeHost(ctx context.Context, ip string, cfg Config) (p *Probe, err error)
 	// we already obtained; turn any panic into an enumeration note.
 	defer func() {
 		if r := recover(); r != nil {
+			if p == nil {
+				p = &Probe{}
+			}
 			p.EnumErr = fmt.Sprintf("enumeration panic: %v", r)
 			err = nil
 		}
@@ -60,7 +62,8 @@ func ProbeHost(ctx context.Context, ip string, cfg Config) (p *Probe, err error)
 
 	// SMB1 is probed on its own connection (servers that disabled it may reset
 	// the socket) and concurrently with the SMB2 handshake, so it costs latency
-	// only once.
+	// only once. The goroutine recovers on its own: nothing above it on the
+	// stack would catch a panic, so a hostile SMB1 reply must not crash the scan.
 	type smb1Result struct {
 		ok      bool
 		signing string
@@ -68,22 +71,14 @@ func ProbeHost(ctx context.Context, ip string, cfg Config) (p *Probe, err error)
 	smb1ch := make(chan smb1Result, 1)
 	go func() {
 		var r smb1Result
+		defer func() {
+			_ = recover()
+			smb1ch <- r
+		}()
 		if c, err := dial(ctx, addr, cfg); err == nil {
 			r.ok, r.signing, _ = c.negotiateSMB1(ctx)
 			_ = c.Close()
 		}
-		smb1ch <- r
-	}()
-	var smb1Once sync.Once
-	var smb1 smb1Result
-	getSMB1 := func() smb1Result {
-		smb1Once.Do(func() { smb1 = <-smb1ch })
-		return smb1
-	}
-	defer func() {
-		r := getSMB1()
-		p.SMB1 = r.ok
-		p.SMB1Signing = r.signing
 	}()
 
 	authKinds := []string{"null", "guest"}
@@ -102,9 +97,6 @@ func ProbeHost(ctx context.Context, ip string, cfg Config) (p *Probe, err error)
 		}
 		p.Dialect = dialectName(nr.Dialect)
 		p.Signing = nr.Signing
-		if p.Identity.isZero() {
-			// identity is filled during session setup
-		}
 		res, err := c.loginWithRetry(ctx, kind)
 		identity := c.serverIdentity
 		_ = c.Close()
@@ -124,6 +116,14 @@ func ProbeHost(ctx context.Context, ip string, cfg Config) (p *Probe, err error)
 			break
 		}
 	}
+
+	// Collect the SMB1 result before deciding whether this is SMB at all: an
+	// SMB1-only server (SMB2 disabled) is still a valid, reportable host. Reading
+	// the channel here — rather than in a defer — guarantees no write to p runs
+	// after the nil return below, which used to cause a nil-pointer panic.
+	smb1 := <-smb1ch
+	p.SMB1 = smb1.ok
+	p.SMB1Signing = smb1.signing
 
 	if p.Dialect == "" && !p.SMB1 {
 		if lastErr != nil {
@@ -278,9 +278,22 @@ func (c *Client) readDir(ctx context.Context, share, dir string) ([]Entry, error
 	defer c.c.treeDisconnect(ctx, tree.id)
 
 	path := normaliseSharePath(dir)
+	// FileAttributes must be 0 when opening a directory: FILE_ATTRIBUTE_NORMAL
+	// (0x80) contradicts FILE_DIRECTORY_FILE and strict servers (Samba, most
+	// NAS appliances) answer STATUS_INVALID_PARAMETER — which is why some shares
+	// enumerated but refused to open as a file tree.
 	id, _, _, err := c.c.create(ctx, tree.id, path,
 		fileListDirectory|fileReadAttributes|readControl,
-		0x80, 7, fileOpen, fileDirectoryFile|fileSynchronousIoNonAlert)
+		0, 7, fileOpen, fileDirectoryFile|fileSynchronousIoNonAlert)
+	if st, ok := err.(Status); ok && st == StatusInvalidParameter {
+		// A handful of embedded SMB stacks — NAS appliances with their own
+		// cut-down server, LaCie's being one seen in the wild — still answer
+		// STATUS_INVALID_PARAMETER to the combination above. Retry with the
+		// bare minimum the spec allows: no CreateOptions, no ReadControl,
+		// just enough access to list the directory. This only fires on that
+		// specific error, so well-behaved servers are unaffected.
+		id, _, _, err = c.c.create(ctx, tree.id, path, fileListDirectory, 0, 7, fileOpen, 0)
+	}
 	if err != nil {
 		return nil, err
 	}

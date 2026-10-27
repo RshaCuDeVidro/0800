@@ -221,7 +221,11 @@ func (c *conn) call(ctx context.Context, cmd uint16, treeID uint32, sessionID ui
 		return header{}, nil, err
 	}
 
-	for i := 0; i < 8; i++ {
+	// The socket deadline set above is the real bound on how long this can
+	// run; this count only guards against a chatty/hostile peer that keeps
+	// the connection alive while never sending the matching reply, which
+	// would otherwise spin reading frames until the deadline regardless.
+	for i := 0; i < 64; i++ {
 		frame, err := c.readFrame()
 		if err != nil {
 			return header{}, nil, err
@@ -270,6 +274,20 @@ func u64(b []byte, off int) uint64 {
 }
 
 func align4(n int) int { return (n + 3) &^ 3 }
+
+// filetimeToTime converts an MS-DTYP FILETIME (100ns ticks since
+// 1601-01-01T00:00:00Z) to a time.Time. It is the single source of truth for
+// this conversion: negotiate.go, ntlm.go and file.go all parse a FILETIME off
+// the wire and used to each do the epoch math slightly differently.
+func filetimeToTime(v uint64) time.Time {
+	if v == 0 {
+		return time.Time{}
+	}
+	const epochDiff = 11644473600 // seconds between 1601-01-01 and 1970-01-01
+	sec := int64(v/10_000_000) - epochDiff
+	nsec := int64(v%10_000_000) * 100
+	return time.Unix(sec, nsec)
+}
 
 func utf16le(s string) []byte {
 	u := utf16.Encode([]rune(s))

@@ -14,7 +14,7 @@ import (
 func NewDemo(width, height int, variant string) *Model {
 	hosts := []string{
 		"192.0.2.10", "192.0.2.24", "192.0.2.90",
-		"198.51.100.7", "198.51.100.42", "198.51.100.200",
+		"198.51.100.7", "198.51.100.42", "198.51.100.77", "198.51.100.200",
 		"203.0.113.9", "203.0.113.55",
 	}
 	st := scan.NewStore(hosts, nil)
@@ -151,6 +151,23 @@ func NewDemo(width, height int, variant string) *Model {
 		Evidence: []string{"+PONG", "INFO server -> redis_version:7.2.4"},
 	})
 	st.Finish("203.0.113.9", 410*time.Millisecond)
+
+	// 7b. FTP server with anonymous login enabled.
+	st.PortOpen("198.51.100.77", 21)
+	st.SetFTP("198.51.100.77", &scan.FTPView{
+		Port: 21, Banner: "ProFTPD 1.3.5e Server (NAS01)", AnonOK: true,
+		Code: 230, Message: "Anonymous access granted, restrictions apply",
+	})
+	st.AddFinding("198.51.100.77", scan.Finding{
+		At:   time.Now().Add(-14 * time.Second),
+		Port: 21, Proto: "ftp", Kind: "ftp-anon", Label: "anonymous login", Severity: scan.SevHigh,
+		Detail: "FTP server accepted anonymous/anonymous@0800.scan with no further checks",
+		Evidence: []string{
+			"220 ProFTPD 1.3.5e Server (NAS01)",
+			"USER anonymous / PASS anonymous@0800.scan -> 230 Anonymous access granted, restrictions apply",
+		},
+	})
+	st.Finish("198.51.100.77", 455*time.Millisecond)
 
 	// 7. Hardened-ish host: port open, guest denied.
 	st.PortOpen("203.0.113.55", 445)

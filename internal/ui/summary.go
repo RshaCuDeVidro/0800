@@ -72,7 +72,7 @@ func renderSummary(snap *scan.Snapshot, w, h, offset int, focused bool) string {
 	for _, n := range snap.ByProto {
 		total += n
 	}
-	for _, k := range []string{"smb", "ldap", "nfs", "postgres", "mysql", "redis", "kerberos"} {
+	for _, k := range []string{"smb", "ldap", "nfs", "ftp", "postgres", "mysql", "redis", "kerberos"} {
 		n := snap.ByProto[k]
 		if n == 0 {
 			continue

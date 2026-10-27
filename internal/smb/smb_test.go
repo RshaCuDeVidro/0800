@@ -21,6 +21,11 @@ type fakeSMB struct {
 	nullOK   bool
 	guestOK  bool
 	conns    atomic.Int32
+
+	// quirkyCreate makes the share-root CREATE fail with
+	// STATUS_INVALID_PARAMETER when CreateOptions is non-zero, mimicking the
+	// embedded NAS stacks that reject FILE_DIRECTORY_FILE|FILE_SYNCHRONOUS_IO_NONALERT.
+	quirkyCreate bool
 }
 
 func startFake(t *testing.T, signMode uint16) *fakeSMB {
@@ -128,6 +133,10 @@ func (f *fakeSMB) handle(c net.Conn) {
 			name := utf16At(body, 44, 46)
 			if strings.HasPrefix(strings.ToLower(name), "srvsvc") {
 				f.reply(c, cmdCreate, StatusObjectNameNotFound, h.MessageID, session, h.TreeID, nil)
+				continue
+			}
+			if f.quirkyCreate && name == "" && u32(body, 40) != 0 {
+				f.reply(c, cmdCreate, StatusInvalidParameter, h.MessageID, session, h.TreeID, nil)
 				continue
 			}
 			resp := make([]byte, 88)
@@ -356,6 +365,74 @@ func TestProbeHostNullSession(t *testing.T) {
 	}
 }
 
+// TestProbeHostNotSMBNoPanic covers a port that accepts TCP but never speaks
+// SMB (it closes the connection immediately). This used to crash the prober
+// with "nil pointer dereference": a deferred SMB1 collector wrote to the Probe
+// after the not-an-SMB-service path had set it to nil. The probe must now
+// return a plain error instead.
+func TestProbeHostNotSMBNoPanic(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close() // never negotiate
+		}
+	}()
+
+	cfg := DefaultConfig()
+	cfg.Port = ln.Addr().(*net.TCPAddr).Port
+	cfg.DialTimeout = time.Second
+	cfg.IOTimeout = time.Second
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	p, err := ProbeHost(ctx, "127.0.0.1", cfg)
+	if err == nil {
+		t.Fatalf("expected an error for a non-SMB port, got probe %+v", p)
+	}
+	if p != nil {
+		t.Errorf("probe must be nil on error, got %+v", p)
+	}
+}
+
+// TestClientListAndReadQuirkyNAS reproduces a NAS appliance that answers
+// STATUS_INVALID_PARAMETER to the textbook directory CREATE: ReadDir must
+// fall back to the minimal CreateOptions and still list the share.
+func TestClientListAndReadQuirkyNAS(t *testing.T) {
+	f := startFake(t, 0x01)
+	f.quirkyCreate = true
+	host, port := f.addr()
+
+	cfg := DefaultConfig()
+	cfg.Port = port
+	cfg.IOTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	c, err := Connect(ctx, host, "null", cfg)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer c.Close()
+
+	entries, err := c.ReadDir(ctx, "public", "")
+	if err != nil {
+		t.Fatalf("readdir should have fallen back to minimal CreateOptions: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d: %+v", len(entries), entries)
+	}
+}
+
 func TestClientListAndRead(t *testing.T) {
 	f := startFake(t, 0x01)
 	host, port := f.addr()
@@ -489,6 +566,38 @@ func TestParseDirEntries(t *testing.T) {
 	}
 	if !entries[1].Dir {
 		t.Error("second entry should be a directory")
+	}
+}
+
+// TestParseDirEntriesRejectsShortNextOffset guards against a malformed (or
+// hostile) QUERY_DIRECTORY reply whose NextEntryOffset points into the
+// middle of the entry it belongs to instead of past it: parsing must fail
+// loudly instead of decoding garbage as a second entry.
+func TestParseDirEntriesRejectsShortNextOffset(t *testing.T) {
+	buf := dirEntry("a.txt", 0, 10)
+	putU32(buf, 0, 1) // NextEntryOffset = 1, far below the 104-byte fixed header
+
+	resp := make([]byte, 8+len(buf))
+	putU16(resp, 0, 9)
+	putU16(resp, 2, 72)
+	putU32(resp, 4, uint32(len(buf)))
+	copy(resp[8:], buf)
+
+	if _, err := parseDirEntries(resp); err == nil {
+		t.Fatal("expected an error for a NextEntryOffset shorter than the fixed entry header")
+	}
+}
+
+func TestFiletimeToTime(t *testing.T) {
+	if got := filetimeToTime(0); !got.IsZero() {
+		t.Errorf("filetimeToTime(0) = %v, want zero time", got)
+	}
+	// 2021-01-01T00:00:00Z expressed as FILETIME ticks (100ns since
+	// 1601-01-01), computed independently of the function under test.
+	want := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+	ticks := uint64(want.Unix()+11644473600) * 10_000_000
+	if got := filetimeToTime(ticks).UTC(); !got.Equal(want) {
+		t.Errorf("filetimeToTime(%d) = %v, want %v", ticks, got, want)
 	}
 }
 

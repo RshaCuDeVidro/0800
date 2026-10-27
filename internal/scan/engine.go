@@ -21,6 +21,11 @@ type Config struct {
 	ProbeWorkers int
 	Rate         int // dials per second, 0 = unlimited
 	HostBudget   time.Duration
+	// Retries is the number of extra TCP dial attempts after the first one,
+	// with a small linear backoff between them. 0 (the default) keeps the
+	// original fail-fast behaviour; raise it on flaky networks where a dial
+	// timeout doesn't necessarily mean the port is closed.
+	Retries int
 	// EnumShares runs share enumeration (srvsvc) during the scan. The browser
 	// can always enumerate on demand.
 	EnumShares bool
@@ -33,7 +38,7 @@ type Config struct {
 }
 
 // DefaultPorts is the default scan set.
-var DefaultPorts = []int{445, 88, 389, 2049, 3306, 5432, 6379}
+var DefaultPorts = []int{21, 445, 88, 389, 2049, 3306, 5432, 6379}
 
 // Engine runs the two-stage scan: a fast TCP sweep followed by protocol probes
 // only on ports that answered.
@@ -185,8 +190,7 @@ func (e *Engine) checkPort(ctx context.Context, h *hostTask, port int) {
 		}
 	}
 
-	d := net.Dialer{Timeout: e.cfg.DialTimeout}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(h.ip, strconv.Itoa(port)))
+	conn, err := e.dialWithRetry(ctx, h.ip, port)
 	if err != nil {
 		return
 	}
@@ -200,6 +204,32 @@ func (e *Engine) checkPort(ctx context.Context, h *hostTask, port int) {
 	case e.probeCh <- probeJob{host: h, port: port}:
 	case <-ctx.Done():
 		h.pending.Add(-1)
+	}
+}
+
+// dialWithRetry dials once, then retries up to e.cfg.Retries more times with
+// a linear backoff (150ms, 300ms, 450ms, ...) on failure. A context
+// cancellation during the backoff wait aborts immediately.
+func (e *Engine) dialWithRetry(ctx context.Context, ip string, port int) (net.Conn, error) {
+	d := net.Dialer{Timeout: e.cfg.DialTimeout}
+	addr := net.JoinHostPort(ip, strconv.Itoa(port))
+
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if attempt >= e.cfg.Retries {
+			return nil, lastErr
+		}
+		backoff := time.Duration(attempt+1) * 150 * time.Millisecond
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 }
 

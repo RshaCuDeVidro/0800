@@ -19,13 +19,14 @@ keyboard-driven terminal UI, a headless mode for pipelines, and JSON output for 
 
 | Service | Checks | "0800" verdict |
 | --- | --- | --- |
-| **SMB (445)** | NEGOTIATE, dialects 2.0.2→3.0.2, SMB1 probe, signing mode, NTLM challenge fingerprint, null session, `guest` + empty password | `STATUS_SUCCESS` on `SESSION_SETUP`, shares enumerated |
+| **SMB (445)** | NEGOTIATE, dialects 2.0.2→3.0.2, SMB1 probe, signing mode, NTLM challenge fingerprint, null session, `guest` + empty password | `STATUS_SUCCESS` on `SESSION_SETUP`, shares enumerated, legacy SMB1+no-signing flagged as MS17-010/relay surface |
 | **Kerberos (88)** | reachability + correlation with LDAP/SMB | domain-controller confidence score |
 | **LDAP (389)** | anonymous bind, root DSE, bounded search (`sizeLimit=5`) | objects readable without credentials |
 | **NFS (2049)** | portmapper, `MOUNT_EXPORT`, `MOUNT` with `AUTH_UNIX` (root → nobody fallback), `READDIR` | export mounted and listed |
 | **MySQL (3306)** | handshake, auth plugin, `root`/`mysql`/`admin` with empty password | `OK` packet |
 | **PostgreSQL (5432)** | `StartupMessage`, `AuthenticationOk` (trust) | trust authentication |
 | **Redis (6379)** | `PING`, `INFO server`, `DBSIZE` | `+PONG` |
+| **FTP (21)** | `USER anonymous` / `PASS anonymous@0800.scan`, control channel only | `230` login, no file is ever listed or transferred |
 
 Everything is **read-only**: no uploads, no writes, no deletes, no password spraying. At most
 **two** authentication attempts are made per host (null, then guest) so account lockout policies
@@ -93,13 +94,14 @@ No runtime dependencies: `CGO_ENABLED=0`, pure Go DNS resolver, no `libsmbclient
 flags:
   -t, --target         IP, CIDR, hostname, file or @file (repeatable)
       --exclude        CIDR or IP to skip (repeatable)
-  -p                   comma separated ports (default 445,88,389,2049,3306,5432,6379)
+  -p                   comma separated ports (default 21,445,88,389,2049,3306,5432,6379)
       --timeout        TCP dial timeout (default 700ms)
       --io-timeout     per protocol timeout (default 6s)
       --profile        port preset: full, quick, ad, smb, db
   -c                   parallel TCP workers (default 1024)
       --probe-workers  parallel protocol workers (default 64)
       --rate           max dials/second (0 = unlimited)
+      --retries        extra TCP dial attempts on failure, with backoff (default 0)
       --enum-shares    probe common share names during the scan (short list)
       --menu           always show the interactive setup screen
       --no-menu        skip the setup screen (scripts)
@@ -108,10 +110,17 @@ flags:
       --flat           download straight into the loot root
       --remap          probe a non-standard port, e.g. smb=1445,ldap=1389
       --json           write a JSON report
+      --markdown       write a Markdown report
+      --html           write a self-contained HTML report
+      --checkpoint     autosave the report path(s) above at this interval (default 20s, 0 disables)
       --plain          headless output
       --no-color       disable ANSI colours
       --demo           run the TUI with built-in example data
 ```
+
+Reports: `--json`, `--markdown` and `--html` can be combined; each is written once at the end of
+the scan and, unless `--checkpoint 0`, refreshed every 20s while a long scan is still running, so
+killing the process loses at most one interval's worth of results instead of everything.
 
 ### Keys
 

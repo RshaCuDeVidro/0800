@@ -365,7 +365,7 @@ func srvShareType(t uint32) string {
 	case 2:
 		return "device"
 	case 3:
-		return "pipe"
+		return "ipc" // STYPE_IPC (MS-SRVS), e.g. IPC$
 	default:
 		return "other"
 	}

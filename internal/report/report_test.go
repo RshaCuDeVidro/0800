@@ -97,6 +97,59 @@ func TestSummary(t *testing.T) {
 	}
 }
 
+func TestWriteHTML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "report.html")
+	if err := WriteHTML(path, Build(sampleSnapshot(), "test")); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"<!doctype html>",
+		"192.0.2.10",
+		"null session",
+		"sev-critical",
+		"written permission to test",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("html missing %q", want)
+		}
+	}
+	// A silent host must not appear, and the page must stay valid HTML even
+	// with a hostname/banner that happens to contain markup.
+	if strings.Contains(text, "192.0.2.11") {
+		t.Error("silent host should be omitted")
+	}
+}
+
+func TestWriteHTMLEscapesUntrustedFields(t *testing.T) {
+	st := scan.NewStore([]string{"192.0.2.20"}, nil)
+	st.SetSMB("192.0.2.20", &scan.SMBView{
+		Auth: "null", Host: `<script>alert(1)</script>`,
+		Shares: []scan.ShareView{{Name: `"><img src=x>`, Type: "disk"}},
+	})
+	st.AddFinding("192.0.2.20", scan.Finding{
+		Port: 445, Proto: "smb", Kind: "smb-null", Label: "null session",
+		Severity: scan.SevCritical, Detail: "anonymous session",
+	})
+	st.Refresh()
+
+	path := filepath.Join(t.TempDir(), "escape.html")
+	if err := WriteHTML(path, Build(st.Snapshot(), "test")); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "<script>") {
+		t.Error("untrusted host field was not HTML-escaped")
+	}
+}
+
 func TestWriteMarkdown(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "report.md")
 	if err := WriteMarkdown(path, Build(sampleSnapshot(), "test")); err != nil {

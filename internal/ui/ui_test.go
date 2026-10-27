@@ -148,6 +148,73 @@ func TestDetailsAndHelp(t *testing.T) {
 	}
 }
 
+// TestFTPHostOpensInfoPanel covers the gap where an FTP-only host (no SMB,
+// NFS or DB) used to fall through to an empty panel on enter: FTP never
+// opens a data channel, so there is nothing to browse, but the login result
+// must still be shown instead of a blank screen.
+func TestFTPHostOpensInfoPanel(t *testing.T) {
+	m := NewDemo(120, 40, "main")
+	m.filter = "" // make sure the FTP demo host is in the visible list
+	m.allHosts = true
+	m.refresh()
+
+	idx := indexOf(m.hosts, "198.51.100.77")
+	if m.hosts[idx].IP != "198.51.100.77" {
+		t.Fatalf("FTP demo host not found in host list")
+	}
+	m.cursor = idx
+
+	m.Update(press("enter"))
+	if m.browser.mode != modeInfo {
+		t.Fatalf("mode = %v, want modeInfo", m.browser.mode)
+	}
+	if m.browser.proto != "ftp" {
+		t.Errorf("proto = %q, want ftp", m.browser.proto)
+	}
+	view := m.View()
+	if !strings.Contains(view, "anonymous login accepted") {
+		t.Errorf("view missing the FTP login result: %s", view)
+	}
+}
+
+// TestFTPCountedInOverviews guards the dashboard/summary protocol breakdown,
+// which lists protocols by a hardcoded set of keys: adding a protocol to the
+// scanner is easy to forget to also add there.
+func TestFTPCountedInOverviews(t *testing.T) {
+	m := NewDemo(120, 40, "main")
+	if n := m.snap.ByProto["ftp"]; n != 1 {
+		t.Fatalf("ByProto[ftp] = %d, want 1", n)
+	}
+
+	m.Update(press("s"))
+	if !strings.Contains(m.View(), "ftp") {
+		t.Error("summary view should break down the ftp protocol count")
+	}
+	m.Update(press("s"))
+
+	dash := renderDashboard(m.snap, 100, 30, false, false)
+	if !strings.Contains(dash, "ftp") {
+		t.Error("dashboard view should break down the ftp protocol count")
+	}
+}
+
+// TestFTPDetailsLine guards the "tab" details pane, which lists protocols
+// section by section: FTP must get the same treatment as SMB/LDAP/NFS.
+func TestFTPDetailsLine(t *testing.T) {
+	host := &scan.HostView{
+		IP:  "198.51.100.77",
+		FTP: &scan.FTPView{Port: 21, Banner: "ProFTPD ready", AnonOK: true, Code: 230, Message: "ok"},
+	}
+	lines := detailsLines(host, 80)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "ProFTPD ready") {
+		t.Errorf("details missing the ftp banner: %s", joined)
+	}
+	if !strings.Contains(joined, "anonymous login accepted") {
+		t.Errorf("details missing the anonymous-login call-out: %s", joined)
+	}
+}
+
 func TestQuit(t *testing.T) {
 	m := NewDemo(120, 40, "main")
 	_, cmd := m.Update(press("q"))
@@ -172,6 +239,61 @@ func TestBrowserNavigation(t *testing.T) {
 	m.Update(press("k"))
 	if m.browser.cursor != start {
 		t.Errorf("cursor = %d, want %d", m.browser.cursor, start)
+	}
+}
+
+// TestDetailsFromBrowserReturnsToBrowser guards a real regression: opening
+// the details overlay (tab) while browsing a directory, then closing it
+// (esc/h), used to drop focus to the host list, where the next "enter"
+// called openHost() and silently reset the whole browser session — closing
+// the remote connection and discarding the directory the user had navigated
+// into. Closing the overlay must instead return to that same session.
+func TestDetailsFromBrowserReturnsToBrowser(t *testing.T) {
+	m := NewDemo(120, 40, "browser")
+	if m.browser.mode != modeDir {
+		t.Fatalf("precondition: mode = %v, want modeDir", m.browser.mode)
+	}
+	wantPath := m.browser.path
+	wantEntries := len(m.browser.entries)
+	m.focus = 1
+
+	m.Update(press("tab"))
+	if !m.showDetails || m.focus != 1 {
+		t.Fatalf("after tab: showDetails=%v focus=%d, want true/1", m.showDetails, m.focus)
+	}
+
+	m.Update(press("esc"))
+	if m.showDetails {
+		t.Fatal("esc should close the details overlay")
+	}
+	if m.focus != 1 {
+		t.Errorf("focus = %d, want 1 (back to the browser, not the host list)", m.focus)
+	}
+	if m.browser.mode != modeDir || m.browser.path != wantPath || len(m.browser.entries) != wantEntries {
+		t.Errorf("browser session was reset: mode=%v path=%q entries=%d",
+			m.browser.mode, m.browser.path, len(m.browser.entries))
+	}
+}
+
+// TestDetailsFromEmptyBrowserReturnsToHostList is the other half of the fix
+// above: a host with nothing to browse has no browser session to return to,
+// so closing its details overlay still goes back to the host list.
+func TestDetailsFromEmptyBrowserReturnsToHostList(t *testing.T) {
+	m := NewDemo(120, 40, "main")
+	// 192.0.2.90 is the demo host with a closed SMB port and nothing
+	// browsable (modeEmpty once opened).
+	m.cursor = indexOf(m.hosts, "192.0.2.90")
+	m.Update(press("enter"))
+	if m.browser.mode != modeEmpty {
+		t.Fatalf("precondition: mode = %v, want modeEmpty", m.browser.mode)
+	}
+	if !m.showDetails {
+		t.Fatal("opening a host with nothing to browse should show its details")
+	}
+
+	m.Update(press("esc"))
+	if m.focus != 0 {
+		t.Errorf("focus = %d, want 0 (nothing to go back to)", m.focus)
 	}
 }
 
@@ -264,6 +386,39 @@ func TestDestPathUsesLootDir(t *testing.T) {
 	again := m.destPath("senhas.txt")
 	if again == got {
 		t.Error("expected a collision suffix")
+	}
+}
+
+// TestDestPathCollisionOnExtensionlessFileKeepsIPIntact reproduces a real
+// bug: the collision suffix used to be computed by splitting the *whole*
+// path on its last ".", not just the filename. A host IP like 192.0.2.24 has
+// dots too, so downloading a second, extensionless file (no dot of its own)
+// put the "(1)" suffix in the middle of the IP address instead of after the
+// filename.
+func TestDestPathCollisionOnExtensionlessFileKeepsIPIntact(t *testing.T) {
+	m := NewDemo(120, 40, "browser")
+	m.cfg.LootDir = t.TempDir()
+	m.browser.hostIP = "192.0.2.24"
+	m.browser.share = "public"
+	m.browser.path = ""
+
+	first := m.destPath("README") // no extension: the bug needs this
+	if err := writeFile(first); err != nil {
+		t.Fatal(err)
+	}
+
+	second := m.destPath("README")
+	if second == first {
+		t.Fatal("expected a collision suffix")
+	}
+	if !strings.Contains(second, "192.0.2.24") {
+		t.Errorf("host IP was mangled by the collision suffix: %s", second)
+	}
+	if !strings.HasSuffix(filepath.Base(second), ")") {
+		t.Errorf("collision suffix should be on the filename, got %s", second)
+	}
+	if filepath.Dir(second) != filepath.Dir(first) {
+		t.Errorf("collision changed the directory: %s vs %s", filepath.Dir(second), filepath.Dir(first))
 	}
 }
 

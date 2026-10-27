@@ -104,6 +104,9 @@ func PlainLine(h *scan.HostView) string {
 	if h.LDAP != nil && h.LDAP.Entries > 0 {
 		fmt.Fprintf(&b, " ldap_anon=%d", h.LDAP.Entries)
 	}
+	if h.FTP != nil && h.FTP.AnonOK {
+		b.WriteString(" ftp_anon=1")
+	}
 	for _, d := range h.DBs {
 		fmt.Fprintf(&b, " %s=%s", d.Proto, d.Status)
 	}

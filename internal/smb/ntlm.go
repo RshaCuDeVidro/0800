@@ -97,8 +97,7 @@ func parseAVPairs(b []byte, ch *Challenge) {
 			ch.Identity.Forest = fromUTF16LE(val)
 		case 7:
 			if len(val) == 8 {
-				ft := binary.LittleEndian.Uint64(val)
-				ch.Identity.Time = time.Unix(int64(ft)/1e7-11644473600, 0)
+				ch.Identity.Time = filetimeToTime(binary.LittleEndian.Uint64(val))
 			}
 		}
 	}

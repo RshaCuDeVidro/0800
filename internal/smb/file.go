@@ -98,7 +98,13 @@ func (c *conn) queryDirectory(ctx context.Context, treeID uint32, id [16]byte) (
 		copy(b[8:24], id[:])
 		putU16(b, 24, uint16(smb2HeaderSize+fixed))
 		putU16(b, 26, uint16(len(pat)))
-		putU32(b, 28, 1<<20)
+		// Never request more than the negotiated MaxTransactSize: appliances that
+		// cap it return STATUS_INVALID_PARAMETER for an oversized output buffer.
+		outLen := uint32(1 << 20)
+		if c.maxTrans > 0 && c.maxTrans < outLen {
+			outLen = c.maxTrans
+		}
+		putU32(b, 28, outLen)
 		copy(b[fixed:], pat)
 
 		h, resp, err := c.call(ctx, cmdQueryDirectory, treeID, c.sessionID, b)
@@ -136,17 +142,28 @@ func parseDirEntries(resp []byte) ([]Entry, error) {
 	}
 	buf := resp[off : off+n]
 
+	// fixedEntrySize is the FileIdBothDirectoryInformation layout before the
+	// variable-length name (MS-FSCC 2.4.17): NextEntryOffset through the
+	// 24-byte ShortName/Reserved2/FileId tail.
+	const fixedEntrySize = 104
+
 	var out []Entry
-	for pos := 0; pos+104 <= len(buf); {
+	for pos := 0; pos+fixedEntrySize <= len(buf); {
 		next := int(u32(buf, pos))
 		nameLen := int(u32(buf, pos+60))
-		if nameLen < 0 || pos+104+nameLen > len(buf) {
+		if nameLen < 0 || pos+fixedEntrySize+nameLen > len(buf) {
 			return out, fmt.Errorf("smb: truncated directory entry")
 		}
-		name := fromUTF16LE(buf[pos+104 : pos+104+nameLen])
+		// A non-zero NextEntryOffset must clear at least this entry's own
+		// fixed header, or we would seek into the middle of it and decode
+		// garbage as a new entry on a malformed/hostile response.
+		if next != 0 && next < fixedEntrySize {
+			return out, fmt.Errorf("smb: invalid directory entry offset %d", next)
+		}
+		name := fromUTF16LE(buf[pos+fixedEntrySize : pos+fixedEntrySize+nameLen])
 		attrs := u32(buf, pos+56)
 		size := int64(u64(buf, pos+40))
-		mtime := filetime(u64(buf, pos+24))
+		mtime := filetimeToTime(u64(buf, pos+24))
 
 		if name != "." && name != ".." && name != "" {
 			out = append(out, Entry{
@@ -163,16 +180,6 @@ func parseDirEntries(resp []byte) ([]Entry, error) {
 		pos += next
 	}
 	return out, nil
-}
-
-func filetime(v uint64) time.Time {
-	if v == 0 {
-		return time.Time{}
-	}
-	// FILETIME counts 100ns ticks since 1601-01-01.
-	sec := int64(v/10_000_000) - 11644473600
-	nsec := int64(v%10_000_000) * 100
-	return time.Unix(sec, nsec)
 }
 
 const readChunk = 1 << 20

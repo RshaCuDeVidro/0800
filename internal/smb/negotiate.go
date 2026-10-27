@@ -63,9 +63,7 @@ func (c *conn) negotiateSMB2(ctx context.Context) (*negotiateResp, error) {
 	}
 	copy(r.ServerGUID[:], resp[8:24])
 
-	if ft := u64(resp, 40); ft > 0 {
-		r.ServerTime = time.Unix(int64(ft)/1e7-11644473600, 0)
-	}
+	r.ServerTime = filetimeToTime(u64(resp, 40))
 
 	c.dialect = r.Dialect
 	c.maxRead = clamp(r.MaxRead, 64*1024, 8<<20)

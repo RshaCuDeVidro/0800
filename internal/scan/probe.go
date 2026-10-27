@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/RshaCuDeVidro/0800/internal/db"
+	"github.com/RshaCuDeVidro/0800/internal/ftp"
 	"github.com/RshaCuDeVidro/0800/internal/ldap"
 	"github.com/RshaCuDeVidro/0800/internal/nfs"
 	"github.com/RshaCuDeVidro/0800/internal/smb"
@@ -28,6 +29,8 @@ func (e *Engine) dispatch(ctx context.Context, ip string, port int) {
 		e.probeDB(ctx, ip, port)
 	case "kerberos":
 		e.probeKerberos(ctx, ip)
+	case "ftp":
+		e.probeFTP(ctx, ip, port)
 	default:
 		e.banner(ctx, ip, port)
 	}
@@ -54,6 +57,8 @@ func (e *Engine) serviceFor(port int) string {
 		return "redis"
 	case 88:
 		return "kerberos"
+	case 21:
+		return "ftp"
 	}
 	return ""
 }
@@ -147,6 +152,19 @@ func (e *Engine) probeSMB(ctx context.Context, ip string, port int) {
 			Port: port, Proto: "smb", Kind: "smb1", Label: "smb1",
 			Severity: SevLow, Detail: "SMB1 dialect accepted (" + p.SMB1Signing + " signing)",
 		})
+		// This is a protocol-negotiation heuristic, not an exploit attempt:
+		// SMB1 without mandatory signing is exactly the surface MS17-010
+		// (EternalBlue) and SMB relay target. Flag it distinctly from the
+		// bare "smb1" note above so it isn't buried as low severity.
+		if p.SMB1Signing != "required" {
+			e.store.AddFinding(ip, Finding{
+				Port: port, Proto: "smb", Kind: "smb1-legacy-exploit-surface",
+				Label: "legacy SMB1 exploit surface", Severity: SevHigh,
+				Detail: "SMB1 enabled without mandatory signing: exposed to the MS17-010/" +
+					"EternalBlue exploit class and SMB relay on an unpatched host " +
+					"(negotiation-based heuristic — no exploit was attempted)",
+			})
+		}
 	}
 	if len(view.Shares) > 0 {
 		names := make([]string, 0, len(view.Shares))
@@ -306,6 +324,36 @@ func (e *Engine) probeKerberos(ctx context.Context, ip string) {
 		Port: 88, Proto: "kerberos", Kind: "kdc", Label: "kdc",
 		Severity: SevInfo, Detail: "Kerberos KDC reachable",
 	})
+}
+
+// probeFTP tries an anonymous login. It never opens a data channel: no file
+// is listed or transferred, only the control-channel login is exercised.
+func (e *Engine) probeFTP(ctx context.Context, ip string, port int) {
+	res, err := ftp.Probe(ctx, ip, port, e.cfg.IOTimeout)
+	if err != nil {
+		banner := err.Error()
+		if res != nil && res.Banner != "" {
+			banner = res.Banner
+		}
+		e.store.SetService(ip, ServiceView{Port: port, Proto: "ftp", Banner: banner})
+		return
+	}
+
+	view := &FTPView{Port: port, Banner: res.Banner, AnonOK: res.AnonOK, Code: res.Code, Message: res.Message}
+	e.store.SetFTP(ip, view)
+	e.store.SetService(ip, ServiceView{Port: port, Proto: "ftp", Banner: res.Banner})
+
+	if res.AnonOK {
+		e.store.AddFinding(ip, Finding{
+			Port: port, Proto: "ftp", Kind: "ftp-anon", Label: "anonymous login",
+			Severity: SevHigh,
+			Detail:   "FTP server accepted anonymous/anonymous@0800.scan with no further checks",
+			Evidence: []string{
+				fmt.Sprintf("220 %s", res.Banner),
+				fmt.Sprintf("USER anonymous / PASS anonymous@0800.scan -> %d %s", res.Code, res.Message),
+			},
+		})
+	}
 }
 
 func (e *Engine) probeDB(ctx context.Context, ip string, port int) {

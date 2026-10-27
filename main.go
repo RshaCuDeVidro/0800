@@ -48,7 +48,7 @@ func run() error {
 	var (
 		targets     stringList
 		exclude     stringList
-		portsFlag   = flag.String("p", "445,88,389,2049,3306,5432,6379", "comma separated ports to test")
+		portsFlag   = flag.String("p", "21,445,88,389,2049,3306,5432,6379", "comma separated ports to test")
 		timeout     = flag.Duration("timeout", 500*time.Millisecond, "TCP dial timeout")
 		ioTimeout   = flag.Duration("io-timeout", 4*time.Second, "per protocol I/O timeout")
 		concurrency = flag.Int("c", 1024, "parallel TCP workers")
@@ -59,6 +59,10 @@ func run() error {
 		loot        = flag.String("loot", "0800-loot", "directory for downloaded files")
 		flat        = flag.Bool("flat", false, "download straight into the loot root")
 		jsonPath    = flag.String("json", "", "write a JSON report to this path")
+		mdPath      = flag.String("markdown", "", "write a Markdown report to this path")
+		htmlPath    = flag.String("html", "", "write a self-contained HTML report to this path")
+		checkpoint  = flag.Duration("checkpoint", 20*time.Second, "autosave the partial report(s) at this interval while scanning (0 disables)")
+		retries     = flag.Int("retries", 0, "extra TCP dial attempts on a failed connection, with backoff")
 		plain       = flag.Bool("plain", false, "headless output, no TUI")
 		profile     = flag.String("profile", "", "port preset: full, quick, ad, smb, db")
 		enumShares  = flag.Bool("enum-shares", true, "enumerate shares during the scan (short list)")
@@ -201,6 +205,7 @@ func run() error {
 		Concurrency:  *concurrency,
 		ProbeWorkers: *probes,
 		Rate:         *rate,
+		Retries:      *retries,
 		ServicePorts: servicePorts,
 		EnumShares:   *enumShares,
 	}
@@ -210,25 +215,30 @@ func run() error {
 			fmt.Printf("%s %s\n", severityPrefix(h), report.PlainLine(h))
 		}
 		eng := scan.New(cfg)
-		if err := eng.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		scanCtx, cancelScan := context.WithCancel(ctx)
+		stopCheckpoint := startCheckpointer(scanCtx, eng, version, *checkpoint, *jsonPath, *mdPath, *htmlPath)
+		err := eng.Run(scanCtx)
+		cancelScan()
+		stopCheckpoint()
+		if err != nil && !errors.Is(err, context.Canceled) {
 			return err
 		}
 		snap := eng.Store().Snapshot()
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, "  "+report.Summary(snap))
-		if *jsonPath != "" {
-			if err := report.WriteJSON(*jsonPath, report.Build(snap, version)); err != nil {
-				return err
-			}
-			fmt.Fprintln(os.Stderr, "  report: "+*jsonPath)
-		}
-		return nil
+		return writeReports(snap, version, *jsonPath, *mdPath, *htmlPath)
 	}
 
 	scanCtx, cancelScan := context.WithCancel(ctx)
-	defer cancelScan()
-
 	eng := scan.New(cfg)
+	stopCheckpoint := startCheckpointer(scanCtx, eng, version, *checkpoint, *jsonPath, *mdPath, *htmlPath)
+	// A single defer, in this order: cancelScan must run before stopCheckpoint
+	// blocks on it, on every exit path (including an early return from
+	// p.Run()'s error case below, not just the normal fallthrough).
+	defer func() {
+		cancelScan()
+		stopCheckpoint()
+	}()
 	model := ui.New(ui.Config{
 		Store:      eng.Store(),
 		LootDir:    *loot,
@@ -259,13 +269,69 @@ func run() error {
 	stop()
 	if st := eng.Store(); st != nil {
 		st.Complete()
-		if *jsonPath != "" {
-			if err := report.WriteJSON(*jsonPath, report.Build(st.Snapshot(), version)); err != nil {
-				return err
-			}
+		if err := writeReports(st.Snapshot(), version, *jsonPath, *mdPath, *htmlPath); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// writeReports writes every report format the caller asked for (an empty
+// path skips that format) and prints where each one landed.
+func writeReports(snap *scan.Snapshot, version, jsonPath, mdPath, htmlPath string) error {
+	return writeReportsAnnounce(snap, version, jsonPath, mdPath, htmlPath, true)
+}
+
+func writeReportsAnnounce(snap *scan.Snapshot, version, jsonPath, mdPath, htmlPath string, announce bool) error {
+	doc := report.Build(snap, version)
+	type target struct {
+		path  string
+		write func(string, report.Document) error
+	}
+	for _, t := range []target{
+		{jsonPath, report.WriteJSON},
+		{mdPath, report.WriteMarkdown},
+		{htmlPath, report.WriteHTML},
+	} {
+		if t.path == "" {
+			continue
+		}
+		if err := t.write(t.path, doc); err != nil {
+			return err
+		}
+		if announce {
+			fmt.Fprintln(os.Stderr, "  report: "+t.path)
+		}
+	}
+	return nil
+}
+
+// startCheckpointer periodically writes the report format(s) the user asked
+// for while a long scan is still running, so killing the process (or it
+// crashing) loses at most one interval's worth of findings instead of the
+// whole scan. It writes quietly — no per-tick "report: ..." line — and the
+// final writeReports call after the scan finishes overwrites it with the
+// complete result. The returned func stops the ticker and must be called
+// exactly once.
+func startCheckpointer(ctx context.Context, eng *scan.Engine, version string, interval time.Duration, jsonPath, mdPath, htmlPath string) func() {
+	if interval <= 0 || (jsonPath == "" && mdPath == "" && htmlPath == "") {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				_ = writeReportsAnnounce(eng.Store().Snapshot(), version, jsonPath, mdPath, htmlPath, false)
+			}
+		}
+	}()
+	return func() { <-done }
 }
 
 func runDemo(w, h int) error {
@@ -292,7 +358,7 @@ func parseRemap(s string) (map[int]string, []int, error) {
 	}
 	valid := map[string]bool{
 		"smb": true, "ldap": true, "nfs": true, "kerberos": true,
-		"mysql": true, "postgres": true, "redis": true,
+		"mysql": true, "postgres": true, "redis": true, "ftp": true,
 	}
 	for _, pair := range strings.Split(s, ",") {
 		pair = strings.TrimSpace(pair)

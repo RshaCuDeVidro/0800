@@ -114,6 +114,9 @@ func (s *Store) publishLocked() {
 		if h.NFS != nil {
 			snap.ByProto["nfs"]++
 		}
+		if h.FTP != nil {
+			snap.ByProto["ftp"]++
+		}
 		for _, f := range h.Findings {
 			switch f.Severity {
 			case SevCritical:
@@ -210,8 +213,11 @@ func derive(v *HostView, s *Store) {
 			}
 			add(fmt.Sprintf("%d shares", n), sv)
 		}
-		if v.SMB.Signing == "disabled" || v.SMB.Signing == "enabled" {
+		switch v.SMB.Signing {
+		case "disabled":
 			add("sig off", SevLow)
+		case "enabled":
+			add("sig optional", SevInfo)
 		}
 		if v.SMB.SMB1 {
 			add("smb1", SevLow)
@@ -236,6 +242,9 @@ func derive(v *HostView, s *Store) {
 		case v.LDAP.Bound:
 			add("ldap bind", SevLow)
 		}
+	}
+	if v.FTP != nil && v.FTP.AnonOK {
+		add("ftp anon", SevHigh)
 	}
 	for _, db := range v.DBs {
 		if db.Status == "open" {
@@ -303,6 +312,9 @@ func summarise(v *HostView) string {
 	if v.NFS != nil && len(v.NFS.Exports) > 0 {
 		return fmt.Sprintf("nfs · %d export(s)", len(v.NFS.Exports))
 	}
+	if v.FTP != nil && v.FTP.AnonOK {
+		return "ftp · anonymous login"
+	}
 	for _, db := range v.DBs {
 		if db.Version != "" {
 			return db.Proto + " " + db.Version
@@ -342,8 +354,10 @@ func (s *Store) PortOpen(ip string, port int) {
 	})
 }
 
-// SetService records the banner for an open port.
+// SetService records the banner for an open port. KV is cloned (see SetSMB):
+// callers sometimes build it once and reuse the backing array across calls.
 func (s *Store) SetService(ip string, svc ServiceView) {
+	svc.KV = append([][2]string(nil), svc.KV...)
 	s.mutate(ip, func(v *HostView) {
 		for i := range v.Services {
 			if v.Services[i].Port == svc.Port {
@@ -378,29 +392,73 @@ func (s *Store) AddFinding(ip string, f Finding) {
 	})
 }
 
-// SetSMB stores the SMB fingerprint for a host.
+// SetSMB stores the SMB fingerprint for a host. The view is cloned so a
+// caller that keeps mutating its own *SMBView after the call (e.g. to add
+// shares found on a later probe) can never reach back into an already
+// published, supposedly immutable snapshot.
 func (s *Store) SetSMB(ip string, smb *SMBView) {
+	smb = cloneSMB(smb)
 	s.mutate(ip, func(v *HostView) {
 		v.SMB = smb
-		if smb.Host != "" && v.Name == "" {
+		if smb != nil && smb.Host != "" && v.Name == "" {
 			v.Name = smb.Host
 		}
 	})
 }
 
-// SetNFS stores the NFS fingerprint for a host.
+// SetNFS stores the NFS fingerprint for a host (cloned; see SetSMB).
 func (s *Store) SetNFS(ip string, nfs *NFSView) {
+	nfs = cloneNFS(nfs)
 	s.mutate(ip, func(v *HostView) { v.NFS = nfs })
 }
 
-// SetLDAP stores the LDAP fingerprint for a host.
+// SetLDAP stores the LDAP fingerprint for a host (cloned; see SetSMB).
 func (s *Store) SetLDAP(ip string, l *LDAPView) {
+	l = cloneLDAP(l)
 	s.mutate(ip, func(v *HostView) {
 		v.LDAP = l
-		if l.DNSHost != "" && v.Name == "" {
+		if l != nil && l.DNSHost != "" && v.Name == "" {
 			v.Name = l.DNSHost
 		}
 	})
+}
+
+// cloneSMB returns a deep-enough copy of v: the struct plus its one slice
+// field, so the stored snapshot never aliases memory the caller still holds.
+func cloneSMB(v *SMBView) *SMBView {
+	if v == nil {
+		return nil
+	}
+	c := *v
+	c.Shares = append([]ShareView(nil), v.Shares...)
+	return &c
+}
+
+func cloneNFS(v *NFSView) *NFSView {
+	if v == nil {
+		return nil
+	}
+	c := *v
+	c.Exports = append([]ExportView(nil), v.Exports...)
+	return &c
+}
+
+func cloneLDAP(v *LDAPView) *LDAPView {
+	if v == nil {
+		return nil
+	}
+	c := *v
+	c.Sample = append([]string(nil), v.Sample...)
+	return &c
+}
+
+// SetFTP stores the FTP fingerprint for a host (cloned; see SetSMB).
+func (s *Store) SetFTP(ip string, f *FTPView) {
+	if f != nil {
+		clone := *f
+		f = &clone
+	}
+	s.mutate(ip, func(v *HostView) { v.FTP = f })
 }
 
 // AddDB stores an exposed database fingerprint.

@@ -171,6 +171,17 @@ func (b *browser) openHost(h *scan.HostView) tea.Cmd {
 				b.info = append(b.info, "  "+l)
 			}
 		}
+	case h.FTP != nil:
+		// FTP never opens a data channel, so there is nothing to browse:
+		// show the login result instead of leaving the panel empty.
+		b.mode = modeInfo
+		b.proto = "ftp"
+		b.info = append(b.info, fmt.Sprintf("ftp:%d  %s", h.FTP.Port, h.FTP.Banner))
+		if h.FTP.AnonOK {
+			b.info = append(b.info, "  anonymous login accepted")
+		} else if h.FTP.Message != "" {
+			b.info = append(b.info, fmt.Sprintf("  %d %s", h.FTP.Code, h.FTP.Message))
+		}
 	default:
 		b.mode = modeEmpty
 	}

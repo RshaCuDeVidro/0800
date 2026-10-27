@@ -51,6 +51,9 @@ func renderSelection(host *scan.HostView, w, height int, focused bool) string {
 		if host.NFS != nil && host.NFS.Note != "" {
 			lines = append(lines, styleFaint.Render("nfs · "+host.NFS.Note))
 		}
+		if host.FTP != nil && host.FTP.Banner != "" {
+			lines = append(lines, styleFaint.Render("ftp · "+host.FTP.Banner))
+		}
 	}
 
 	lines = append(lines, "", styleFaint.Render("enter opens it · tab shows every field"))

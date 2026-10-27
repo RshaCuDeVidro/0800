@@ -89,6 +89,9 @@ func WriteMarkdown(path string, doc Document) error {
 		for _, d := range h.DBs {
 			fmt.Fprintf(&b, "- **%s**: %s%s\n", d.Proto, d.Status, versionSuffix(d.Version))
 		}
+		if h.FTP != nil && h.FTP.AnonOK {
+			fmt.Fprintf(&b, "- **ftp**: anonymous login accepted · %s\n", orDash(h.FTP.Banner))
+		}
 		b.WriteString("\n")
 
 		if len(h.Findings) > 0 {

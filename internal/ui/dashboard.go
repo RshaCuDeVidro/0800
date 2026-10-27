@@ -64,7 +64,7 @@ func renderDashboard(snap *scan.Snapshot, w, h int, focused, compact bool) strin
 			total += n
 		}
 		shown := 0
-		for _, k := range []string{"smb", "ldap", "nfs", "postgres", "mysql", "redis", "kerberos"} {
+		for _, k := range []string{"smb", "ldap", "nfs", "ftp", "postgres", "mysql", "redis", "kerberos"} {
 			n := snap.ByProto[k]
 			if n == 0 {
 				continue
