@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 )
@@ -24,7 +25,7 @@ const (
 )
 
 var (
-	uuidSRVSVC = [16]byte{0xC8, 0x2F, 0x32, 0x4B, 0x78, 0x16, 0xD3, 0x01, 0x12, 0x78, 0x5A, 0x47, 0xBF, 0x6E, 0xE1, 0x88}
+	uuidSRVSVC = [16]byte{0xC8, 0x4F, 0x32, 0x4B, 0x70, 0x16, 0xD3, 0x01, 0x12, 0x78, 0x5A, 0x47, 0xBF, 0x6E, 0xE1, 0x88}
 	uuidNDR32  = [16]byte{0x04, 0x5D, 0x88, 0x8A, 0xEB, 0x1C, 0xC9, 0x11, 0x9F, 0xE8, 0x08, 0x00, 0x2B, 0x10, 0x48, 0x60}
 )
 
@@ -55,7 +56,11 @@ func (p *pipe) Close() {
 }
 
 func (p *pipe) write(b []byte) error {
-	return p.c.c.writeAt(p.ctx, p.treeID, p.id, b)
+	err := p.c.c.writeAt(p.ctx, p.treeID, p.id, b)
+	if os.Getenv("SMB_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "pipe write %d bytes err=%v\n", len(b), err)
+	}
+	return err
 }
 
 // readPDU reads one complete PDU, stitching fragments using frag_length.
@@ -64,6 +69,9 @@ func (p *pipe) readPDU() ([]byte, error) {
 	want := -1
 	for i := 0; i < 64; i++ {
 		chunk, err := p.c.c.readAt(p.ctx, p.treeID, p.id, 0, 65536)
+		if os.Getenv("SMB_DEBUG") != "" {
+			fmt.Fprintf(os.Stderr, "pipe read %d bytes err=%v\n", len(chunk), err)
+		}
 		if err != nil {
 			if errors.Is(err, io.EOF) && len(out) > 0 {
 				break
@@ -100,20 +108,25 @@ func rpcHeader(ptype byte, flags byte, callID uint32, body []byte) []byte {
 	return b
 }
 
-func (p *pipe) bind() error {
-	body := make([]byte, 8+4+2+2+24)
+// bindBody builds a DCERPC bind PDU body for srvsvc over NDR32.
+func bindBody() []byte {
+	body := make([]byte, 56)
 	binary.LittleEndian.PutUint16(body[0:], 5840) // max xmit
 	binary.LittleEndian.PutUint16(body[2:], 5840) // max recv
 	binary.LittleEndian.PutUint32(body[4:], 0)    // assoc group
 	body[8] = 1                                   // num contexts
-	body[12] = 0                                  // context id
-	body[13] = 1                                  // num transfer syntaxes
+	body[12] = 0                                  // context id (u16, 12..13)
+	body[13] = 0
+	body[14] = 1 // num transfer syntaxes
 	copy(body[16:32], uuidSRVSVC[:])
 	binary.LittleEndian.PutUint32(body[32:], 3) // interface version
 	copy(body[36:52], uuidNDR32[:])
 	binary.LittleEndian.PutUint32(body[52:], 2)
+	return body
+}
 
-	pdu := rpcHeader(rpcBind, 0x03, p.callID, body)
+func (p *pipe) bind() error {
+	pdu := rpcHeader(rpcBind, 0x03, p.callID, bindBody())
 	if err := p.write(pdu); err != nil {
 		return err
 	}
@@ -184,6 +197,9 @@ func (c *Client) srvsvcListShares(ctx context.Context) ([]Share, error) {
 	if err != nil {
 		return nil, err
 	}
+	if os.Getenv("SMB_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "srvsvc stub: %x\n", stub)
+	}
 	return ndrParseShareEnum(stub)
 }
 
@@ -215,23 +231,26 @@ func (w *ndrWriter) align() {
 }
 
 // ndrShareEnumRequest marshals NetrShareEnum(level 1) with an empty container.
-// Referent IDs are assigned in the order the pointers appear.
+//
+// The wire layout was validated against a real implementation:
+//
+//	ServerName ref, ServerName string (inline pointee),
+//	Level, union tag, container ref, EntriesRead, Buffer ref,
+//	PreferedMaximumLength, ResumeHandle ref, ResumeHandle value
+//
+// TotalEntries is [out] only and is not part of the request stub.
 func ndrShareEnumRequest(server string) []byte {
 	w := &ndrWriter{}
 	w.u32(0x00020000) // [in] ServerName
+	w.str(server)     // its pointee, immediately after the pointer
 	w.u32(1)          // Level
-	w.u32(1)          // SHARE_ENUM_STRUCT.Level
-	w.u32(0x00020004) // union arm -> SHARE_INFO_1_CONTAINER
+	w.u32(1)          // SHARE_ENUM_UNION tag
+	w.u32(0x00020004) // container pointer
+	w.u32(0)          // EntriesRead
+	w.u32(0)          // Buffer (null)
 	w.u32(0xFFFFFFFF) // PreferedMaximumLength
-	w.u32(0x00020008) // [out] TotalEntries
-	w.u32(0x0002000C) // [in,out] ResumeHandle
-
-	// deferred referents
-	w.str(server) // ServerName
-	w.u32(0)      // EntriesRead
-	w.u32(0)      // Buffer (null)
-	w.u32(0)      // TotalEntries
-	w.u32(0)      // ResumeHandle
+	w.u32(0x00020008) // ResumeHandle pointer
+	w.u32(0)          // ResumeHandle value
 	return w.b
 }
 
@@ -283,9 +302,8 @@ type rawShare struct {
 func ndrParseShareEnum(stub []byte) ([]Share, error) {
 	r := &ndrReader{b: stub}
 	level := r.u32()
-	arm := r.u32()
-	totalRef := r.u32()
-	resumeRef := r.u32()
+	_ = r.u32() // union tag (duplicates Level on the wire)
+	container := r.u32()
 	if r.err != nil {
 		return nil, r.err
 	}
@@ -294,7 +312,7 @@ func ndrParseShareEnum(stub []byte) ([]Share, error) {
 	}
 
 	var out []Share
-	if arm != 0 {
+	if container != 0 {
 		entries := r.u32()
 		bufRef := r.u32()
 		if r.err != nil {
@@ -304,8 +322,7 @@ func ndrParseShareEnum(stub []byte) ([]Share, error) {
 			return nil, errors.New("ndr: implausible share count")
 		}
 		if bufRef != 0 {
-			maxCount := r.u32()
-			_ = maxCount
+			_ = r.u32() // array max_count
 			raws := make([]rawShare, entries)
 			for i := range raws {
 				raws[i].nameRef = r.u32()
@@ -315,6 +332,7 @@ func ndrParseShareEnum(stub []byte) ([]Share, error) {
 			if r.err != nil {
 				return nil, r.err
 			}
+			// Strings follow the fixed array, in pointer order per element.
 			for i := range raws {
 				if raws[i].nameRef != 0 {
 					raws[i].name = r.str()
@@ -334,12 +352,6 @@ func ndrParseShareEnum(stub []byte) ([]Share, error) {
 				})
 			}
 		}
-	}
-	if totalRef != 0 {
-		_ = r.u32()
-	}
-	if resumeRef != 0 {
-		_ = r.u32()
 	}
 	return out, r.err
 }

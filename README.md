@@ -160,7 +160,7 @@ $ 0800 -t 192.0.2.0/24 -p 445,389 --plain
 ```json
 {
   "tool": "0800",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "started": "2026-10-27T12:00:00Z",
   "stats": { "targets": 4, "scanned": 4, "openPorts": 6, "findings": 4, "exposedHosts": 3 },
   "hosts": [
@@ -284,6 +284,10 @@ go test -race ./...           # concurrency
 go test -run '^$' -fuzz FuzzParseDirEntries -fuzztime 20s ./internal/smb
 ```
 
+The SMB client is additionally validated against a real SMB2 server (impacket's
+`smbserver`): anonymous/guest authentication, `srvsvc` share enumeration, directory listing and
+file download. The captured NDR response is a permanent regression test.
+
 The test suite stands up **in-process fake servers** for SMB2, LDAP, ONC RPC/MOUNT/NFSv3, MySQL,
 PostgreSQL and Redis, then drives the real client code against them. That means the parsers,
 authentication flows and error paths are exercised without root, Docker or network access.
@@ -328,6 +332,8 @@ go test -tags integration ./internal/integration -v
 
 ## Limitations
 
+- **SMB1 authentication**: SMB1 is detected but sessions are SMB2+. Legacy hosts that only speak
+  NT1 are reported (dialect/signing) but not browsed.
 - **SMB signing**: when a server *requires* signing, `0800` reports the requirement and the
   credential result but does not sign requests, so browsing is disabled. Implementing SMB2
   signing/encryption would require session-key derivation and is intentionally out of scope.

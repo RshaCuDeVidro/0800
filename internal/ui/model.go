@@ -728,11 +728,14 @@ func (m *Model) listRight() string {
 }
 
 func (m *Model) hostRow(h *scan.HostView, selected bool, width int) string {
-	marker := "  "
-	if selected {
-		marker = styleAccent.Render("▌ ")
+	barColor := colFaint
+	if h.Sev > scan.SevInfo {
+		barColor = sevColor(h.Sev)
 	}
-	sev := dot(h.Sev)
+	if selected {
+		barColor = colAccent
+	}
+	bar := lipgloss.NewStyle().Foreground(barColor).Render("▌") + " "
 	ip := h.IP
 
 	avail := width - 2 - 2 - lipgloss.Width(ip) - 1
@@ -769,8 +772,8 @@ func (m *Model) hostRow(h *scan.HostView, selected bool, width int) string {
 			Bold(true).
 			Background(colSel).
 			Foreground(colText).
-			Render(pad("● "+plain, width-2))
-		return pad(marker+line, width)
+			Render(pad(plain, width-2))
+		return pad(bar+line, width)
 	}
 
 	ipStyle := styleIP
@@ -778,7 +781,7 @@ func (m *Model) hostRow(h *scan.HostView, selected bool, width int) string {
 		ipStyle = styleIPPend
 	}
 	if len(shown) == 0 {
-		return pad(marker+sev+" "+ipStyle.Render(truncate(plain, width-4)), width)
+		return pad(bar+ipStyle.Render(truncate(plain, width-4)), width)
 	}
 
 	styleTags := make([]string, 0, len(shown)+1)
@@ -791,12 +794,26 @@ func (m *Model) hostRow(h *scan.HostView, selected bool, width int) string {
 	ipW := max(0, width-4-used-1)
 	left := ipStyle.Render(pad(truncate(ip, ipW), ipW))
 	line := spread(left, strings.Join(styleTags, " "), width-4)
-	return pad(marker+sev+" "+line, width)
+	return pad(bar+line, width)
 }
 
 func (m *Model) header() string {
-	brand := styleAccent.Bold(true).Render("▌ 0800") + styleSubtitle.Render("  null-auth recon")
-	line1 := spread(brand, styleFaint.Render("v"+m.cfg.Version), m.w)
+	band := lipgloss.Color("#101A24")
+	paint := func(fg lipgloss.Color, bold bool, s string) string {
+		st := lipgloss.NewStyle().Foreground(fg).Background(band)
+		if bold {
+			st = st.Bold(true)
+		}
+		return st.Render(s)
+	}
+	left := paint(colAccent, true, "▌ 0800") + paint(colDim, false, "  null-auth recon")
+	right := paint(colFaint, false, versionTag(m.cfg.Version))
+	gap := m.w - lipgloss.Width(left) - lipgloss.Width(right)
+	line1 := left
+	if gap > 0 {
+		line1 += lipgloss.NewStyle().Background(band).Render(strings.Repeat(" ", gap))
+	}
+	line1 += right
 
 	pct := 0.0
 	eta := "—"
@@ -817,7 +834,7 @@ func (m *Model) header() string {
 		rate = fmt.Sprintf("%.1f/s", m.rate)
 	}
 	barW := min(26, max(10, m.w/6))
-	var left string
+	var info string
 	if m.scanning {
 		parts := []string{fmt.Sprintf("%s  %3.0f%%", bar(pct, barW), pct*100), spinner}
 		if rate != "" {
@@ -826,12 +843,12 @@ func (m *Model) header() string {
 		if eta != "—" {
 			parts = append(parts, "eta "+eta)
 		}
-		left = strings.Join(parts, "  ")
+		info = strings.Join(parts, "  ")
 	} else {
-		left = fmt.Sprintf("%s  100%%  %s", bar(1, barW), state)
+		info = fmt.Sprintf("%s  100%%  %s", bar(1, barW), state)
 	}
 
-	right := ""
+	counters := ""
 	if m.snap != nil {
 		chips := []string{
 			fmt.Sprintf("%d ports", m.snap.Open),
@@ -847,12 +864,12 @@ func (m *Model) header() string {
 		if m.snap.Med > 0 {
 			sev = append(sev, lipgloss.NewStyle().Foreground(colMed).Bold(true).Render(fmt.Sprintf("%dM", m.snap.Med)))
 		}
-		right = styleDim.Render(strings.Join(chips, " · "))
+		counters = styleDim.Render(strings.Join(chips, " · "))
 		if len(sev) > 0 {
-			right += styleFaint.Render(" · ") + strings.Join(sev, " ")
+			counters += styleFaint.Render(" · ") + strings.Join(sev, " ")
 		}
 	}
-	line2 := spread(left, right, m.w)
+	line2 := spread(info, counters, m.w)
 	style2 := styleText
 	if !m.scanning {
 		style2 = styleDim

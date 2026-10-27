@@ -17,7 +17,7 @@ func renderSelection(host *scan.HostView, w, height int, focused bool) string {
 	var lines []string
 
 	lines = append(lines, "")
-	head := dot(host.Sev) + " " + styleText.Bold(true).Render(host.IP)
+	head := pill(sevShort(host.Sev), host.Sev) + " " + styleText.Bold(true).Render(host.IP)
 	if host.Name != "" && host.Name != host.IP {
 		head += "  " + styleDim.Render(host.Name)
 	}
