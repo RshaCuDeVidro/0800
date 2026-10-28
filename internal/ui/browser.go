@@ -315,7 +315,7 @@ func (b *browser) loadSharesCmd() tea.Cmd {
 func (b *browser) applyShares(msg sharesMsg) {
 	b.loading = false
 	if msg.err != nil {
-		b.err = msg.err.Error()
+		b.err = prettyFS(msg.err.Error())
 		return
 	}
 	b.allShares = msg.shares
@@ -440,7 +440,7 @@ func (b *browser) closeFS() {
 func (b *browser) applyConnected(msg connectedMsg) {
 	b.loading = false
 	if msg.err != nil {
-		b.err = msg.err.Error()
+		b.err = fmt.Sprintf("%s · %s", msg.share, prettyFS(msg.err.Error()))
 		return
 	}
 	b.fs = msg.fs
@@ -457,7 +457,7 @@ func (b *browser) applyConnected(msg connectedMsg) {
 func (b *browser) applyListed(msg listedMsg) {
 	b.loading = false
 	if msg.err != nil {
-		b.err = msg.err.Error()
+		b.err = fmt.Sprintf("%s · %s", msg.share, prettyFS(msg.err.Error()))
 		return
 	}
 	b.path = msg.path
@@ -582,7 +582,7 @@ func (b *browser) renderList(visible, width int) string {
 
 	var prefix string
 	if b.err != "" {
-		prefix = styleErr.Render("  "+truncate(prettyFS(b.err), width-4)) + "\n"
+		prefix = styleErr.Render("  "+truncate(b.err, width-4)) + "\n"
 		visible = max(1, visible-1)
 	}
 

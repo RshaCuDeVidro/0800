@@ -609,7 +609,7 @@ func TestParseDirEntries(t *testing.T) {
 	putU32(resp, 4, uint32(len(buf)))
 	copy(resp[8:], buf)
 
-	entries, err := parseDirEntries(resp)
+	entries, err := parseDirEntries(resp, 0x25)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -638,7 +638,7 @@ func TestParseDirEntriesRejectsShortNextOffset(t *testing.T) {
 	putU32(resp, 4, uint32(len(buf)))
 	copy(resp[8:], buf)
 
-	if _, err := parseDirEntries(resp); err == nil {
+	if _, err := parseDirEntries(resp, 0x25); err == nil {
 		t.Fatal("expected an error for a NextEntryOffset shorter than the fixed entry header")
 	}
 }
@@ -722,7 +722,7 @@ func TestNDRShareEnumRoundTrip(t *testing.T) {
 func FuzzParseDirEntries(f *testing.F) {
 	f.Add([]byte{0, 0, 0, 0})
 	f.Fuzz(func(t *testing.T, data []byte) {
-		_, _ = parseDirEntries(data)
+		_, _ = parseDirEntries(data, 0x25)
 	})
 }
 
@@ -973,5 +973,29 @@ func TestConcurrentCallsOnOneSession(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Errorf("concurrent call failed: %v", err)
+	}
+}
+
+func TestParseDirEntriesClass01(t *testing.T) {
+	// FileDirectoryInformation: 64-byte header, name at 64.
+	name := utf16le("notes.txt")
+	buf := make([]byte, 64+len(name))
+	putU32(buf, 60, uint32(len(name)))
+	putU32(buf, 56, 0) // regular file
+	putU64(buf, 40, 42)
+	copy(buf[64:], name)
+
+	resp := make([]byte, 8+len(buf))
+	putU16(resp, 0, 9)
+	putU16(resp, 2, 72)
+	putU32(resp, 4, uint32(len(buf)))
+	copy(resp[8:], buf)
+
+	entries, err := parseDirEntries(resp, 0x01)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name != "notes.txt" || entries[0].Size != 42 {
+		t.Fatalf("entries = %+v", entries)
 	}
 }

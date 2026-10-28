@@ -29,7 +29,7 @@ import (
 	"golang.org/x/term"
 )
 
-var version = "0.5.0"
+var version = "0.5.1"
 
 type stringList []string
 

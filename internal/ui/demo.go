@@ -187,7 +187,7 @@ func NewDemo(width, height int, variant string) *Model {
 	m := New(Config{
 		Store:      st,
 		LootDir:    "0800-loot",
-		Version:    "0.5.0",
+		Version:    "0.5.1",
 		Width:      width,
 		Height:     height,
 		NFSTimeout: 8 * time.Second,

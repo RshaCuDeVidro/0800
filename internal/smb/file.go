@@ -80,6 +80,19 @@ func (c *conn) closeFile(ctx context.Context, treeID uint32, id [16]byte) {
 // queryDirectory lists a directory handle. It transparently pages through
 // results until the server reports STATUS_NO_MORE_FILES.
 func (c *conn) queryDirectory(ctx context.Context, treeID uint32, id [16]byte) ([]Entry, error) {
+	entries, err := c.queryDirectoryClass(ctx, treeID, id, 0x25)
+	if st, ok := err.(Status); ok && (st == StatusInvalidParameter || st == StatusNotSupported) {
+		// Cut-down SMB stacks (NAS appliances, some Samba builds) reject
+		// FileIdBothDirectoryInformation and only implement the older
+		// FileDirectoryInformation class.
+		if alt, altErr := c.queryDirectoryClass(ctx, treeID, id, 0x01); altErr == nil {
+			return alt, nil
+		}
+	}
+	return entries, err
+}
+
+func (c *conn) queryDirectoryClass(ctx context.Context, treeID uint32, id [16]byte, class byte) ([]Entry, error) {
 	var out []Entry
 	pattern := "*"
 	restart := true
@@ -89,7 +102,7 @@ func (c *conn) queryDirectory(ctx context.Context, treeID uint32, id [16]byte) (
 		const fixed = 32
 		b := make([]byte, fixed+len(pat))
 		putU16(b, 0, 33)
-		b[2] = 0x25 // FileIdBothDirectoryInformation
+		b[2] = class
 		flags := byte(0)
 		if restart {
 			flags |= 0x01
@@ -117,7 +130,7 @@ func (c *conn) queryDirectory(ctx context.Context, treeID uint32, id [16]byte) (
 		if !h.Status.OK() {
 			return out, h.Status
 		}
-		entries, err := parseDirEntries(resp)
+		entries, err := parseDirEntries(resp, class)
 		if err != nil {
 			return out, err
 		}
@@ -131,7 +144,7 @@ func (c *conn) queryDirectory(ctx context.Context, treeID uint32, id [16]byte) (
 }
 
 // parseDirEntries decodes a FileIdBothDirectoryInformation buffer.
-func parseDirEntries(resp []byte) ([]Entry, error) {
+func parseDirEntries(resp []byte, class byte) ([]Entry, error) {
 	if len(resp) < 8 {
 		return nil, fmt.Errorf("smb: short query directory response")
 	}
@@ -142,10 +155,12 @@ func parseDirEntries(resp []byte) ([]Entry, error) {
 	}
 	buf := resp[off : off+n]
 
-	// fixedEntrySize is the FileIdBothDirectoryInformation layout before the
-	// variable-length name (MS-FSCC 2.4.17): NextEntryOffset through the
-	// 24-byte ShortName/Reserved2/FileId tail.
-	const fixedEntrySize = 104
+	// FileIdBothDirectoryInformation (0x25) carries a 104-byte header before
+	// the name; FileDirectoryInformation (0x01) only 64 (MS-FSCC 2.4.17/2.4.10).
+	fixedEntrySize := 104
+	if class == 0x01 {
+		fixedEntrySize = 64
+	}
 
 	var out []Entry
 	for pos := 0; pos+fixedEntrySize <= len(buf); {
