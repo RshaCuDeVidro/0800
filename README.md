@@ -59,14 +59,28 @@ automation never depends on the UI.
 # go install (Go 1.24+)
 go install github.com/RshaCuDeVidro/0800@latest
 
-# or download the archive for your OS/arch from
-# https://github.com/RshaCuDeVidro/0800/releases  (linux|darwin|windows _ amd64|arm64)
+# or grab the archive for your platform from
+# https://github.com/RshaCuDeVidro/0800/releases
 tar xzf 0800_linux_amd64.tar.gz
 sudo mv 0800 /usr/local/bin/
 ```
 
 Prebuilt binaries are available for Linux, macOS and Windows on `amd64` and `arm64`.
 No runtime dependencies: `CGO_ENABLED=0`, pure Go DNS resolver, no `libsmbclient`/`libnfs`.
+
+Pick the right asset with `uname -s` (OS) and `uname -m` (CPU):
+
+| Machine | Asset |
+| --- | --- |
+| Linux x86_64 (`uname -m` = `x86_64`) | `0800_linux_amd64.tar.gz` |
+| Linux ARM64 (`aarch64`) | `0800_linux_arm64.tar.gz` |
+| macOS Intel (`x86_64`) | `0800_darwin_amd64.tar.gz` |
+| macOS Apple Silicon (`arm64`) | `0800_darwin_arm64.tar.gz` |
+| Windows x64 | `0800_windows_amd64.zip` |
+| Windows ARM | `0800_windows_arm64.zip` |
+
+`darwin` is macOS only. Running a binary built for another OS or CPU fails with
+`Exec format error` — `chmod +x` does not fix that, the format itself is wrong.
 
 ## Usage
 
